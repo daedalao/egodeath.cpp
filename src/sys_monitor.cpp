@@ -5,8 +5,93 @@
 #include <dirent.h>
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
+#include <dlfcn.h>
+
+namespace fs = std::filesystem;
+
+// NVML structures and function pointers for NVIDIA GPU support loaded dynamically at runtime
+typedef int nvmlReturn_t;
+typedef struct nvmlDevice_st* nvmlDevice_t;
+struct nvmlMemory_t {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
+struct nvmlUtilization_t {
+    unsigned int gpu;
+    unsigned int memory;
+};
+
+typedef nvmlReturn_t (*nvmlInit_t)();
+typedef nvmlReturn_t (*nvmlShutdown_t)();
+typedef nvmlReturn_t (*nvmlDeviceGetCount_t)(unsigned int*);
+typedef nvmlReturn_t (*nvmlDeviceGetHandleByIndex_t)(unsigned int, nvmlDevice_t*);
+typedef nvmlReturn_t (*nvmlDeviceGetMemoryInfo_t)(nvmlDevice_t, nvmlMemory_t*);
+typedef nvmlReturn_t (*nvmlDeviceGetUtilizationRates_t)(nvmlDevice_t, nvmlUtilization_t*);
+typedef nvmlReturn_t (*nvmlDeviceGetName_t)(nvmlDevice_t, char*, unsigned int);
 
 namespace egodeath {
+
+// Helper function to lookup PCI device name in /usr/share/hwdata/pci.ids
+static std::string lookup_pci_device(const std::string& vendor_id, const std::string& device_id) {
+    std::ifstream pci_file("/usr/share/hwdata/pci.ids");
+    if (!pci_file) {
+        pci_file.open("/usr/share/misc/pci.ids");
+    }
+    if (!pci_file) return "";
+    
+    std::string line;
+    std::string target_vendor = vendor_id;
+    std::string target_device = device_id;
+    std::transform(target_vendor.begin(), target_vendor.end(), target_vendor.begin(), ::tolower);
+    std::transform(target_device.begin(), target_device.end(), target_device.begin(), ::tolower);
+    
+    bool in_vendor = false;
+    while (std::getline(pci_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        if (line[0] != '\t') {
+            size_t space_pos = line.find("  ");
+            if (space_pos != std::string::npos) {
+                std::string v_id = line.substr(0, space_pos);
+                std::transform(v_id.begin(), v_id.end(), v_id.begin(), ::tolower);
+                if (v_id == target_vendor) {
+                    in_vendor = true;
+                } else {
+                    in_vendor = false;
+                }
+            }
+        } else if (in_vendor && line[1] != '\t') {
+            std::string sub = line.substr(1); // strip tab
+            size_t space_pos = sub.find("  ");
+            if (space_pos != std::string::npos) {
+                std::string d_id = sub.substr(0, space_pos);
+                std::transform(d_id.begin(), d_id.end(), d_id.begin(), ::tolower);
+                if (d_id == target_device) {
+                    return sub.substr(space_pos + 2);
+                }
+            }
+        }
+    }
+    return "";
+}
+
+static std::string get_amd_gpu_name(const std::string& base_path) {
+    std::ifstream v_file(base_path + "vendor");
+    std::ifstream d_file(base_path + "device");
+    std::string vendor, device;
+    if (v_file && d_file) {
+        v_file >> vendor;
+        d_file >> device;
+        if (vendor.rfind("0x", 0) == 0 && vendor.length() > 2) vendor = vendor.substr(2);
+        if (device.rfind("0x", 0) == 0 && device.length() > 2) device = device.substr(2);
+        
+        std::string lookup = lookup_pci_device(vendor, device);
+        if (!lookup.empty()) return lookup;
+    }
+    return "AMD GPU";
+}
 
 SysMonitor::SysMonitor() {
     _update_llama_pid();
@@ -85,9 +170,96 @@ void SysMonitor::_update_llama_cpu() {
 
 void SysMonitor::_update_gpus() {
     stats_.gpus.clear();
-    // Check card1 and card2 (standard for the user's MI25x2 setup)
-    for (int i = 1; i <= 2; ++i) {
-        std::string base = "/sys/class/drm/card" + std::to_string(i) + "/device/";
+    
+    // 1. Try querying NVIDIA GPUs via NVML (loaded dynamically at runtime to avoid static linking issues)
+    void* nvml_handle = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    if (!nvml_handle) {
+        nvml_handle = dlopen("libnvidia-ml.so", RTLD_LAZY);
+    }
+    
+    if (nvml_handle) {
+        auto nvmlInit = (nvmlInit_t)dlsym(nvml_handle, "nvmlInit");
+        auto nvmlShutdown = (nvmlShutdown_t)dlsym(nvml_handle, "nvmlShutdown");
+        auto nvmlDeviceGetCount = (nvmlDeviceGetCount_t)dlsym(nvml_handle, "nvmlDeviceGetCount");
+        auto nvmlDeviceGetHandleByIndex = (nvmlDeviceGetHandleByIndex_t)dlsym(nvml_handle, "nvmlDeviceGetHandleByIndex");
+        auto nvmlDeviceGetMemoryInfo = (nvmlDeviceGetMemoryInfo_t)dlsym(nvml_handle, "nvmlDeviceGetMemoryInfo");
+        auto nvmlDeviceGetUtilizationRates = (nvmlDeviceGetUtilizationRates_t)dlsym(nvml_handle, "nvmlDeviceGetUtilizationRates");
+        auto nvmlDeviceGetName = (nvmlDeviceGetName_t)dlsym(nvml_handle, "nvmlDeviceGetName");
+        
+        if (nvmlInit && nvmlShutdown && nvmlDeviceGetCount && 
+            nvmlDeviceGetHandleByIndex && nvmlDeviceGetMemoryInfo && nvmlDeviceGetUtilizationRates) {
+            
+            if (nvmlInit() == 0) { // NVML_SUCCESS is 0
+                unsigned int device_count = 0;
+                if (nvmlDeviceGetCount(&device_count) == 0 && device_count > 0) {
+                    for (unsigned int i = 0; i < device_count; ++i) {
+                        nvmlDevice_t dev;
+                        if (nvmlDeviceGetHandleByIndex(i, &dev) == 0) {
+                            GPUStats gs;
+                            
+                            // Get VRAM
+                            nvmlMemory_t mem;
+                            if (nvmlDeviceGetMemoryInfo(dev, &mem) == 0) {
+                                gs.vram_total_gb = mem.total / 1024.0 / 1024.0 / 1024.0;
+                                gs.vram_used_gb = mem.used / 1024.0 / 1024.0 / 1024.0;
+                                gs.vram_percent = (100.0 * mem.used) / mem.total;
+                            }
+                            
+                            // Get Util
+                            nvmlUtilization_t util;
+                            if (nvmlDeviceGetUtilizationRates(dev, &util) == 0) {
+                                gs.busy_percent = util.gpu;
+                            }
+                            
+                            // Get Name
+                            char name_buf[96] = {0};
+                            if (nvmlDeviceGetName && nvmlDeviceGetName(dev, name_buf, sizeof(name_buf)) == 0) {
+                                gs.name = name_buf;
+                            } else {
+                                gs.name = "NVIDIA GPU";
+                            }
+                            
+                            stats_.gpus.push_back(gs);
+                        }
+                    }
+                    nvmlShutdown();
+                    dlclose(nvml_handle);
+                    return; // Successfully loaded and queried NVIDIA GPUs
+                }
+                nvmlShutdown();
+            }
+        }
+        dlclose(nvml_handle);
+    }
+    
+    // 2. Fallback: AMD GPU sysfs discovery
+    std::vector<std::string> card_paths;
+    if (fs::exists("/sys/class/drm")) {
+        for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
+            std::string name = entry.path().filename().string();
+            // Match card followed only by digits (e.g., card0, card1)
+            if (name.rfind("card", 0) == 0 && name.length() > 4) {
+                bool digits_only = true;
+                for (size_t i = 4; i < name.length(); ++i) {
+                    if (!std::isdigit(name[i])) {
+                        digits_only = false;
+                        break;
+                    }
+                }
+                if (digits_only) {
+                    std::string total_path = entry.path().string() + "/device/mem_info_vram_total";
+                    if (fs::exists(total_path)) {
+                        card_paths.push_back(entry.path().string() + "/device/");
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort to keep card ordering consistent
+    std::sort(card_paths.begin(), card_paths.end());
+    
+    for (const auto& base : card_paths) {
         GPUStats gs;
         
         std::ifstream busy_file(base + "gpu_busy_percent");
@@ -106,6 +278,8 @@ void SysMonitor::_update_gpus() {
             gs.vram_used_gb = used / 1024.0 / 1024.0 / 1024.0;
             gs.vram_percent = (100.0 * used) / total;
         }
+        
+        gs.name = get_amd_gpu_name(base);
         stats_.gpus.push_back(gs);
     }
 }

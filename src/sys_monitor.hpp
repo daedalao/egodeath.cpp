@@ -7,6 +7,7 @@
 namespace egodeath {
 
 struct GPUStats {
+    std::string name;
     int busy_percent = 0;
     double vram_total_gb = 0.0;
     double vram_used_gb = 0.0;

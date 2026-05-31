@@ -6,8 +6,6 @@
 - [x] Chat history with scrolling
 - [x] Input field with mouse support
 - [x] Performance metrics (tokens/s)
-- [x] Smart scrolling (auto-scrolls to bottom on new messages unless user manually scrolls)
-- [x] Collapsible panels (Alt+R to toggle reasoning display)
 - ⚠️ **Input field does not wrap or expand** (hardcoded to 3 lines, needs dynamic sizing or wrapping support)
 
 ## Key UI Improvement Recommendations
@@ -32,10 +30,8 @@
   *→ Implemented: Click on history line → copy to clipboard (xclip) with fallback status message*
 
 ### 3. Information Density
-- [x] Add collapsible panels (e.g., toggle reasoning display with Alt+R)
-  *→ Implemented: Alt+R (ESC+'r') toggles `show_reasoning_`, visual `[R]` indicator when hidden*
-- [x] Implement smart scrolling that auto-hides when new messages arrive
-  *→ Implemented: `manual_scroll_` flag; auto-reset `scroll_offset_` unless user manually scrolled*
+- [ ] Add collapsible panels (e.g., toggle reasoning display with Alt+R)
+- [ ] Implement smart scrolling that auto-hides when new messages arrive
 - [ ] Add message grouping for tool call sequences
 - [ ] Show token usage estimates per conversation turn
 
@@ -70,12 +66,11 @@
 - [x] Add fuzzy search in chat history (Ctrl+F)
 - [x] **Add command palette (Ctrl+P)** ← completed in patch5_syntax
 
-### Low Priority (Complex Features) — ✅ COMPLETE
-- [x] **Collapsible panels (Alt+R)** ← just completed
-- [x] **Smart scrolling** ← just completed
+### Low Priority (Complex Features)
+- [ ] Collapsible panels
 - [ ] Real-time throughput graph
 - [ ] High contrast mode
 
 ---
 
-*Last updated: 2025-06-20 — after smart scrolling and collapsible panels (Alt+R) implementation, synced with MEMORY_UI_IMPLEMENTATION.md. Noted: Input field wrapping/expansion is pending.*
+*Last updated: 2025-06-20 — after command palette implementation (Ctrl+P), synced with MEMORY_UI_IMPLEMENTATION.md. Noted: Input field wrapping/expansion is pending.*

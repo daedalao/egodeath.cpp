@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    add_compile_options(-O3 -mcpu=power8 -mtune=power8)
+    add_compile_options(-O3)
 endif()
 
 find_package(Threads REQUIRED)
@@ -37,6 +37,7 @@ target_link_libraries(egodeath
     ${NCURSES_LIBRARIES}
     ${GIT2_LIBRARIES}
     ${FMT_LIBRARIES}
+    dl
 )
 
 if(nlohmann_json_FOUND)

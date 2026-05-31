@@ -72,6 +72,10 @@ void Agent::turn_async(int depth) {
                     }
                 }
             }
+        } else if (ev.type == UIEvent::Type::STREAM_END) {
+            if (on_metrics) {
+                on_metrics(ev.tool_call_delta);
+            }
         }
     });
 
@@ -119,7 +123,13 @@ void Agent::turn_async(int depth) {
                 if (call["function"].contains("arguments") && call["function"]["arguments"].is_string()) {
                     arg_str = call["function"]["arguments"].get<std::string>();
                 }
-                json args = json::parse(arg_str);
+                json args;
+                try {
+                    args = json::parse(arg_str);
+                } catch (...) {
+                    tui_.append_history("system", "Dropped tool " + name + " due to arguments parse error.", "system");
+                    continue;
+                }
 
                 tui_.set_activity("calling " + name);
                 std::string res = tools_.dispatch(name, args);

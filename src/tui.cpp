@@ -54,7 +54,7 @@ ProTUI::~ProTUI() { shutdown(); }
 void ProTUI::init() {
     setlocale(LC_ALL, "");
     initscr(); start_color(); use_default_colors();
-    cbreak(); noecho(); keypad(stdscr, TRUE);
+    cbreak(); noecho(); keypad(stdscr, TRUE); nonl();
     if (mouse_enabled_) {
         mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
         printf("\033[?1003h");
@@ -86,7 +86,14 @@ int ProTUI::_get_color_for_type(const std::string& type) const {
 void ProTUI::_setup_windows() {
     std::lock_guard<std::mutex> lock(mtx_);
     int y, x; getmaxyx(stdscr, y, x);
-    int dash_h = 5, in_h = 3, reas_h = show_reasoning_ ? 5 : 0, status_h = 1;
+    
+    // Get dynamic height for dashboard based on detected GPUs
+    SystemStats stats = sys_monitor_.get_stats();
+    int num_gpus = stats.gpus.size();
+    int dash_h = 3 + num_gpus;
+    
+    int in_h = input_lines_ + 2;
+    int reas_h = show_reasoning_ ? 5 : 0, status_h = 1;
     int hist_h = std::max(1, y - dash_h - in_h - reas_h - status_h);
 
     if (dash_win_) delwin(dash_win_);
@@ -102,6 +109,7 @@ void ProTUI::_setup_windows() {
     status_win_ = newwin(status_h, x, dash_h + hist_h + reas_h, 0);
     in_win_ = newwin(in_h, x, y - in_h, 0);
     keypad(in_win_, TRUE);
+    wtimeout(in_win_, 200);
     
     wrapped_history_.clear();
     for (const auto& raw : raw_history_) {
@@ -351,7 +359,7 @@ void ProTUI::_draw_dashboard() {
     mvwaddstr(dash_win_, 1, 58, _get_bar(std::min(100.0, sys_stats_.llama_cpu_percent), 15).c_str());
     wattroff(dash_win_, COLOR_PAIR(3));
 
-    for (size_t i = 0; i < sys_stats_.gpus.size() && i < 2; ++i) {
+    for (size_t i = 0; i < sys_stats_.gpus.size(); ++i) {
         int row = 2 + (int)i;
         auto& g = sys_stats_.gpus[i];
         mvwprintw(dash_win_, row, 2, "GPU%d VRAM: %.1f/%.1fGB", (int)i, g.vram_used_gb, g.vram_total_gb);
@@ -362,6 +370,18 @@ void ProTUI::_draw_dashboard() {
         wattron(dash_win_, COLOR_PAIR(1));
         mvwaddstr(dash_win_, row, 58, _get_bar(g.busy_percent, 15).c_str());
         wattroff(dash_win_, COLOR_PAIR(1));
+
+        // Render GPU name to the right of the utilization bar if space permits
+        if (x > 78) {
+            std::string name_str = " · " + g.name;
+            int max_len = x - 76;
+            if (max_len > 0) {
+                if ((int)name_str.length() > max_len) {
+                    name_str = name_str.substr(0, max_len - 3) + "...";
+                }
+                mvwprintw(dash_win_, row, 75, "%s", name_str.c_str());
+            }
+        }
     }
 
     std::string perf = fmt::format("pp {:.1f} · gen {:.1f} t/s", metrics_.pp_speed.value_or(0.0), metrics_.gen_speed.value_or(0.0));
@@ -437,14 +457,135 @@ void ProTUI::refresh_ui(bool force) {
 std::string ProTUI::get_input() {
     std::string buf; int ch; int pos = 0;
     wtimeout(in_win_, 200); 
+
+    auto redraw_input = [&]() {
+        int text_width = getmaxx(in_win_) - 5;
+        if (text_width <= 0) text_width = 1;
+        
+        // Wrap input text with manual newlines handled
+        std::vector<std::string> wrapped_lines;
+        std::string current_line;
+        for (char c : buf) {
+            if (c == '\n') {
+                wrapped_lines.push_back(current_line);
+                current_line.clear();
+                continue;
+            }
+            current_line += c;
+            if ((int)current_line.length() >= text_width) {
+                wrapped_lines.push_back(current_line);
+                current_line.clear();
+            }
+        }
+        wrapped_lines.push_back(current_line);
+        
+        int total_lines = wrapped_lines.size();
+        
+        // Determine cursor line & col
+        int cursor_line = 0;
+        int cursor_col = 0;
+        int current_line_len = 0;
+        for (int i = 0; i < pos; ++i) {
+            if (buf[i] == '\n') {
+                cursor_line++;
+                cursor_col = 0;
+                current_line_len = 0;
+            } else {
+                cursor_col++;
+                current_line_len++;
+                if (current_line_len >= text_width) {
+                    cursor_line++;
+                    cursor_col = 0;
+                    current_line_len = 0;
+                }
+            }
+        }
+        
+        // Capped input box size to 3 lines of text (total height 5)
+        int needed_lines = std::min(3, total_lines);
+        if (needed_lines != input_lines_) {
+            input_lines_ = needed_lines;
+            _setup_windows();
+            text_width = getmaxx(in_win_) - 5;
+            if (text_width <= 0) text_width = 1;
+        }
+        
+        // Scrolling offset for input text
+        int start_line = 0;
+        if (cursor_line >= 3) {
+            start_line = cursor_line - 2;
+        }
+        
+        werase(in_win_);
+        _draw_borders();
+        for (int r = 0; r < input_lines_; ++r) {
+            int line_idx = start_line + r;
+            if (line_idx < (int)wrapped_lines.size()) {
+                mvwprintw(in_win_, 1 + r, 4, "%s", wrapped_lines[line_idx].c_str());
+            }
+        }
+    };
+
     while (true) {
-        refresh_ui(); wmove(in_win_, 1, 4 + pos); doupdate();
+        int text_width = getmaxx(in_win_) - 5;
+        if (text_width <= 0) text_width = 1;
+        
+        // Determine cursor line & col
+        int cursor_line = 0;
+        int cursor_col = 0;
+        int current_line_len = 0;
+        for (int i = 0; i < pos; ++i) {
+            if (buf[i] == '\n') {
+                cursor_line++;
+                cursor_col = 0;
+                current_line_len = 0;
+            } else {
+                cursor_col++;
+                current_line_len++;
+                if (current_line_len >= text_width) {
+                    cursor_line++;
+                    cursor_col = 0;
+                    current_line_len = 0;
+                }
+            }
+        }
+        
+        int start_line = 0;
+        if (cursor_line >= 3) {
+            start_line = cursor_line - 2;
+        }
+        
+        refresh_ui(); 
+        wmove(in_win_, 1 + (cursor_line - start_line), 4 + cursor_col); 
+        doupdate();
+        
         ch = wgetch(in_win_);
         if (ch == ERR) continue; 
-        if (ch == '\n' || ch == '\r') break;
+
+        // Handle Alt+Enter (ESC + Enter/Shift+Enter) as a newline fallback
+        if (ch == 27) {
+            wtimeout(in_win_, 0);
+            int next_ch = wgetch(in_win_);
+            wtimeout(in_win_, 200);
+            if (next_ch == 13 || next_ch == 10) {
+                buf.insert(pos++, 1, '\n');
+                redraw_input();
+                continue;
+            }
+            if (next_ch != ERR) {
+                ungetch(next_ch);
+            }
+        }
+        
+        if (ch == 13) break; // Enter (CR) submits the prompt (under nonl() mode)
+        if (ch == 10) { // Shift+Enter or Ctrl+J (LF) inserts a newline
+            buf.insert(pos++, 1, '\n');
+            redraw_input();
+            continue;
+        }
         
         // Quick action shortcuts
-        if (ch == 21) { buf.clear(); pos = 0; continue; } // Ctrl+U: clear input
+        if (ch == 21) { buf.clear(); pos = 0; redraw_input(); continue; } // Ctrl+U: clear input
         if (ch == 12) { scroll_offset_ = 0; werase(hist_win_); manual_scroll_ = false; continue; } // Ctrl+L: clear screen view
         if (ch == 5) { // Ctrl+E: edit last user message
             std::string last_user = "";
@@ -457,7 +598,7 @@ std::string ProTUI::get_input() {
                     break;
                 }
             }
-            if (!last_user.empty()) { buf = last_user; pos = buf.length(); }
+            if (!last_user.empty()) { buf = last_user; pos = buf.length(); redraw_input(); }
             continue;
         }
         
@@ -468,7 +609,7 @@ std::string ProTUI::get_input() {
                 command_palette_query_.clear();
                 command_match_indices_.clear();
                 command_selected_idx_ = 0;
-                werase(in_win_); _draw_borders(); mvwprintw(in_win_, 1, 4, "%s", buf.c_str());
+                redraw_input();
                 continue;
             }
             if (ch == KEY_UP) {
@@ -485,7 +626,7 @@ std::string ProTUI::get_input() {
                 refresh_ui(true);
                 continue;
             }
-            if (ch == '\n' || ch == '\r') {
+            if (ch == 13 || ch == 10) {
                 // Execute selected command
                 if (!command_match_indices_.empty() && command_selected_idx_ < (int)command_match_indices_.size()) {
                     int idx = command_match_indices_[command_selected_idx_];
@@ -551,7 +692,7 @@ std::string ProTUI::get_input() {
                 search_query_.clear();
                 scroll_offset_ = 0;
                 manual_scroll_ = false;
-                werase(in_win_); _draw_borders(); mvwprintw(in_win_, 1, 4, "%s", buf.c_str());
+                redraw_input();
                 continue;
             }
             if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
@@ -604,6 +745,8 @@ std::string ProTUI::get_input() {
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) { if (pos > 0) { buf.erase(--pos, 1); } }
         else if (ch == KEY_LEFT) { if (pos > 0) pos--; }
         else if (ch == KEY_RIGHT) { if (pos < (int)buf.length()) pos++; }
+        else if (ch == KEY_HOME) { pos = 0; }
+        else if (ch == KEY_END) { pos = (int)buf.length(); }
         else if (ch == KEY_PPAGE) { scroll_offset_ += 5; manual_scroll_ = true; }
         else if (ch == KEY_NPAGE) { scroll_offset_ = std::max(0, scroll_offset_ - 5); manual_scroll_ = true; }
         else if (ch == KEY_MOUSE) { _handle_mouse(); }
@@ -619,9 +762,12 @@ std::string ProTUI::get_input() {
             // Otherwise, just ignore (Ctrl+P is now palette)
         }
         else if (ch >= 32 && ch <= 126) { buf.insert(pos++, 1, (char)ch); }
-        werase(in_win_); _draw_borders(); mvwprintw(in_win_, 1, 4, "%s", buf.c_str());
+        redraw_input();
     }
-    werase(in_win_); return buf;
+    werase(in_win_);
+    input_lines_ = 1;
+    _setup_windows();
+    return buf;
 }
 
 void ProTUI::add_command_to_history(const std::string& cmd) {

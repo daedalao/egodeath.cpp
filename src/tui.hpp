@@ -119,6 +119,7 @@ private:
     
     // Smart scrolling state
     bool manual_scroll_ = false;
+    int input_lines_ = 1;
     
     // Recent throughput for sparkline
     std::vector<double> recent_throughput_;
