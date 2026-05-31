@@ -1,0 +1,9 @@
+# Build artifacts
+build/
+*.o
+*.d
+src/egodeath
+
+# Temporary files
+src/*.txt
+.qtcreator/
