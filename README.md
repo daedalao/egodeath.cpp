@@ -1,6 +1,6 @@
 # egodeath.cpp
 
-A C++ implementation of the Egodeath agent/system.
+A C++ implementation of the egodeath agent/system.
 
 ## Features
 - TUI with dashboard, reasoning display, and chat history.
