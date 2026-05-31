@@ -61,7 +61,7 @@ json LlamaClient::chat(const json& messages, const std::optional<json>& tools) {
     json body = {{"model", config_.model}, {"messages", messages}, {"stream", false}};
     if (tools) body["tools"] = *tools;
 
-    std::string json_body = body.dump();
+    std::string json_body = body.dump(-1, ' ', false, json::error_handler_t::replace);
     struct curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
     if (config_.api_key) headers = curl_slist_append(headers, ("Authorization: Bearer " + *config_.api_key).c_str());
 
@@ -83,7 +83,7 @@ void LlamaClient::chat_stream(const json& messages, const std::optional<json>& t
     json body = {{"model", config_.model}, {"messages", messages}, {"stream", true}};
     if (tools) body["tools"] = *tools;
 
-    std::string json_body = body.dump();
+    std::string json_body = body.dump(-1, ' ', false, json::error_handler_t::replace);
     StreamCtx ctx{callback, ""};
     struct curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
     if (config_.api_key) headers = curl_slist_append(headers, ("Authorization: Bearer " + *config_.api_key).c_str());
