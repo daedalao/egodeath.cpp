@@ -19,6 +19,7 @@ struct SystemStats {
     double ram_used_gb = 0.0;
     double ram_percent = 0.0;
     double llama_cpu_percent = 0.0;
+    std::string cpu_name;
     std::vector<GPUStats> gpus;
 };
 

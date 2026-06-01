@@ -14,10 +14,9 @@ find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(NCURSES REQUIRED ncursesw)
-pkg_check_modules(GIT2 REQUIRED libgit2)
 pkg_check_modules(FMT REQUIRED fmt)
 
-include_directories(src ${NCURSES_INCLUDE_DIRS} ${GIT2_INCLUDE_DIRS} ${FMT_INCLUDE_DIRS})
+include_directories(src ${NCURSES_INCLUDE_DIRS} ${FMT_INCLUDE_DIRS})
 
 add_executable(egodeath
     src/main.cpp
@@ -35,7 +34,6 @@ target_link_libraries(egodeath
     Threads::Threads 
     CURL::libcurl 
     ${NCURSES_LIBRARIES}
-    ${GIT2_LIBRARIES}
     ${FMT_LIBRARIES}
     dl
 )
