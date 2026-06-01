@@ -1,7 +1,11 @@
 #pragma once
+#include <functional>
 #include "common.hpp"
 #include "sys_monitor.hpp"
 #include <deque>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
 namespace egodeath {
 
@@ -17,6 +21,7 @@ enum class InputMode {
     NORMAL,              // standard input mode (default)
     SEARCH,              // fuzzy search mode (Ctrl+F)
     COMMAND_PALETTE,     // command palette mode (Ctrl+P)
+    HELP,                // help overlay (F1)
 };
 
 class ProTUI {
@@ -49,8 +54,21 @@ public:
     std::string get_next_command();
     void reset_command_history();
     void toggle_reasoning();  // Added: public toggle for Alt+R
+    void set_queued(int n);
+    void activate_last_queued();
+    static void sigint_received(); // called from SIGINT handler
+    void set_cancel_callback(std::function<void()> cb) { cancel_callback_ = std::move(cb); }
+    void set_effort_callback(std::function<void(const std::string&)> cb) { effort_callback_ = std::move(cb); }
+    void set_initial_effort(const std::string& e) { reasoning_effort_ = e; }
+    int request_tool_approval(const std::string& prompt); // worker thread: 0 deny, 1 once, 2 always
+    void set_theme(const std::string& name);
+    std::string current_theme() const { return theme_; }
+    void clear_history();
+    void set_save_callback(std::function<void()> cb) { save_callback_ = std::move(cb); }
+    void set_load_callback(std::function<void()> cb) { load_callback_ = std::move(cb); }
 
     bool is_running() const { return running_; }
+    bool is_history_empty() const;  // Check if history is empty (thread-safe)
 
 private:
     void _setup_windows();
@@ -67,6 +85,8 @@ private:
     void _update_search_results();
     void _update_command_palette_results();
     void _render_command_palette();
+    void _render_help();
+    void _apply_theme(const std::string& name);
     
     WINDOW *dash_win_ = nullptr;
     WINDOW *hist_win_ = nullptr;
@@ -93,8 +113,8 @@ private:
     int scroll_offset_ = 0;
     bool running_ = false;
     bool show_reasoning_ = true;
-    bool mouse_enabled_ = true;
-    std::mutex mtx_;
+    bool mouse_enabled_ = false;
+    mutable std::mutex mtx_;
     
     // Command history
     std::deque<std::string> command_history_;
@@ -119,6 +139,21 @@ private:
     
     // Smart scrolling state
     bool manual_scroll_ = false;
+    int last_ch_ = 0;
+    int reas_scroll_offset_ = 0;
+    int queued_depth_ = 0;
+    std::string pending_paste_;
+    std::function<void()> cancel_callback_; // large paste staged for submission
+    std::function<void(const std::string&)> effort_callback_;
+    std::function<void()> save_callback_;
+    std::function<void()> load_callback_;
+    std::string reasoning_effort_ = "medium";
+    std::string theme_ = "dark";
+    std::atomic<bool> approval_pending_{false};
+    std::mutex approval_mtx_;
+    std::condition_variable approval_cv_;
+    std::string approval_prompt_;
+    int approval_result_ = -1;
     int input_lines_ = 1;
     
     // Recent throughput for sparkline

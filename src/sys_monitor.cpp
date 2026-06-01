@@ -93,7 +93,58 @@ static std::string get_amd_gpu_name(const std::string& base_path) {
     return "AMD GPU";
 }
 
+static std::string detect_cpu_name() {
+    std::ifstream f("/proc/cpuinfo");
+    std::string line, found;
+    while (std::getline(f, line)) {
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        if (key == "model name" || (key == "cpu" && found.empty())) {
+            found = line.size() > colon + 2 ? line.substr(colon + 2) : "";
+            if (key == "model name") break; // prefer over "cpu"
+        }
+    }
+    if (found.empty()) return "CPU";
+
+    // Remove trademark marks: (R) (TM) (r) (tm)
+    for (const std::string& m : {"(R)", "(TM)", "(r)", "(tm)"}) {
+        size_t p;
+        while ((p = found.find(m)) != std::string::npos) found.erase(p, m.size());
+    }
+    // Remove frequency suffix " @ X.XXGHz"
+    size_t at = found.find(" @ ");
+    if (at != std::string::npos) found.resize(at);
+    // Remove "N-Core ..." suffix (e.g. "16-Core Processor")
+    size_t core = found.find("-Core");
+    if (core != std::string::npos) {
+        size_t sp = found.rfind(' ', core);
+        if (sp != std::string::npos) found.resize(sp);
+    }
+    // Remove trailing " Processor" / " CPU"
+    for (const std::string& s : {" Processor", " CPU"}) {
+        if (found.size() >= s.size() &&
+            found.compare(found.size() - s.size(), s.size(), s) == 0)
+            found.resize(found.size() - s.size());
+    }
+    // Remove POWER-style " (raw),..." suffix
+    size_t paren = found.find(" (");
+    if (paren != std::string::npos) found.resize(paren);
+    size_t comma = found.find(',');
+    if (comma != std::string::npos) found.resize(comma);
+    // Collapse multiple spaces and trim
+    std::string out;
+    for (char ch : found) {
+        if (ch == ' ' && (out.empty() || out.back() == ' ')) continue;
+        out += ch;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out.empty() ? "CPU" : out;
+}
+
 SysMonitor::SysMonitor() {
+    stats_.cpu_name = detect_cpu_name();
     _update_llama_pid();
 }
 

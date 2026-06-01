@@ -7,3 +7,6 @@ src/egodeath
 # Temporary files
 src/*.txt
 .qtcreator/
+
+# Local project state (memory store, trust marker)
+.egodeath/
