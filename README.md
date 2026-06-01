@@ -4,26 +4,6 @@ A terminal agent interface for locally-hosted LLMs. Connects to any llama.cpp-co
 server (`/v1/chat/completions`) and provides a multi-panel ncurses TUI with real-time
 streaming, agentic tool use, persistent memory, and hardware monitoring.
 
-```
-┌─ System Dashboard ─────────────────────────────────────────────── pp 142.3 · gen 18.7 t/s ─┐
-│ RAM: 3.1/123.8GB  ██████──────────  Llama CPU: 12.4%  ████──────────   pp 142.3 · gen 18.7 t/s  │
-│                                                                              ctx 30% / 4096  │
-│ GPU0 VRAM: 6.4/8.0GB  ████████───  GPU0 UTIL: 73%     ████████────  · Vega 10 [Radeon …]  │
-└──────────────────────────────────────────────────────────────────────────────────────────────┘
-  you › what files are in the project root?
-  ▸ list_directory  .
-    src/  build/  CMakeLists.txt  README.md
-    … 48 chars  5 lines
-  egodeath › The project contains the following at the root: …
-┌─ Thinking ───────────────────────────────────────────────────────────────────────────────────┐
-│ I need to list the directory first to answer accurately …                                    │
-└──────────────────────────────────────────────────────────────────────────────────────────────┘
-  egodeath: ready
-┌─ Input ──────────────────────────────────────────────────────────────────────────────────────┐
-│ ▌                                                                                            │
-└──────────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
 ---
 
 ## Features
