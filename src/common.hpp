@@ -24,6 +24,8 @@ using json = nlohmann::json;
 struct Metrics {
     std::optional<double> pp_speed;
     std::optional<double> gen_speed;
+    std::optional<int> ctx_used;
+    std::optional<int> ctx_size;
 };
 
 struct UIState {
@@ -34,10 +36,11 @@ struct UIState {
 };
 
 struct UIEvent {
-    enum class Type { STREAM_CONTENT, STREAM_REASONING, STREAM_TOOL_CALL, STREAM_END };
+    enum class Type { STREAM_CONTENT, STREAM_REASONING, STREAM_TOOL_CALL, STREAM_END, USER_INPUT, USER_INPUT_QUEUED, ACTIVATE_QUEUED, STREAM_START, METRICS_UPDATE, TOOL_DISPLAY };
     Type type;
     std::string content;
     json tool_call_delta = json::object();
+    json timings = json::object();
 };
 
 extern const std::string DEFAULT_SYSTEM_PROMPT;
