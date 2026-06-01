@@ -11,6 +11,7 @@ public:
         std::optional<std::string> api_key;
         int timeout_seconds = 1800;
         bool verbose = false;
+        std::string reasoning_effort = "medium"; // low | medium | high (sent when non-empty)
     };
 
     explicit LlamaClient(Config config);
@@ -20,7 +21,11 @@ public:
     
     void chat_stream(const json& messages,
                     const std::optional<json>& tools,
-                    std::function<void(const UIEvent&)> callback);
+                    std::function<void(const UIEvent&)> callback,
+                    std::atomic<bool>* cancel = nullptr);
+
+    int get_context_size() const;
+    void set_reasoning_effort(const std::string& e) { config_.reasoning_effort = e; }
 
 private:
     static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp);
@@ -28,11 +33,14 @@ private:
     struct StreamCtx {
         std::function<void(const UIEvent&)> cb;
         std::string buffer;
+        std::atomic<bool>* cancel = nullptr;
     };
     static size_t StreamCallback(void* contents, size_t size, size_t nmemb, void* userp);
 
     Config config_;
-    CURL* curl_;
+    
+    // Thread-safe curl handle management: use local handles per request
+    CURL* create_curl_handle() const;
 };
 
 } // namespace egodeath
