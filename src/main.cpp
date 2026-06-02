@@ -115,6 +115,7 @@ int main() {
     });
     tui.set_editor_save_fn([&](const std::string& p, const std::string& c) { return agent.editor_save(p, c); });
     tui.set_last_file_provider([&]() { return agent.last_written_file(); });
+    tui.set_editor_dock(pref_str("editor_dock", "right"));
 
     agent.on_metrics = [&](const json& m) {
         Metrics metrics;
@@ -183,6 +184,16 @@ int main() {
         // Inline slash command: /agenda or /tasks (open the task/calendar view)
         if (input == "/agenda" || input == "/tasks" || input == "/cal" || input == "/calendar") {
             tui.open_agenda();
+            continue;
+        }
+
+        // Inline slash command: /editdock left|right|bottom|full (where the editor pane appears)
+        if (input.rfind("/editdock", 0) == 0) {
+            std::string arg = input.size() > 9 ? input.substr(9) : std::string();
+            while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
+            while (!arg.empty() && arg.back() == ' ') arg.pop_back();
+            if (arg.empty()) tui.append_history("", "editor dock: " + tui.editor_dock() + "  (usage: /editdock left|right|bottom|full)", "system");
+            else { tui.set_editor_dock(arg); tui.append_history("", "editor dock set to: " + tui.editor_dock(), "system"); }
             continue;
         }
 

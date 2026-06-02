@@ -197,7 +197,10 @@ void ProTUI::_setup_windows() {
     
     int in_h = input_lines_ + 2;
     int reas_h = show_reasoning_ ? 5 : 0, status_h = 1;
-    int hist_h = std::max(1, y - dash_h - in_h - reas_h - status_h);
+    int cx0 = rsv_left_;
+    int cw = std::max(10, x - rsv_left_ - rsv_right_);
+    int cy_avail = std::max(6, y - rsv_bottom_);
+    int hist_h = std::max(1, cy_avail - dash_h - in_h - reas_h - status_h);
 
     if (dash_win_) delwin(dash_win_);
     if (hist_win_) delwin(hist_win_);
@@ -205,18 +208,18 @@ void ProTUI::_setup_windows() {
     if (in_win_) delwin(in_win_);
     if (status_win_) delwin(status_win_);
 
-    dash_win_ = newwin(dash_h, x, 0, 0);
-    hist_win_ = newwin(hist_h, x, dash_h, 0);
+    dash_win_ = newwin(dash_h, cw, 0, cx0);
+    hist_win_ = newwin(hist_h, cw, dash_h, cx0);
     scrollok(hist_win_, TRUE);
-    if (show_reasoning_) reas_win_ = newwin(reas_h, x, dash_h + hist_h, 0);
-    status_win_ = newwin(status_h, x, dash_h + hist_h + reas_h, 0);
-    in_win_ = newwin(in_h, x, y - in_h, 0);
+    if (show_reasoning_) reas_win_ = newwin(reas_h, cw, dash_h + hist_h, cx0);
+    status_win_ = newwin(status_h, cw, dash_h + hist_h + reas_h, cx0);
+    in_win_ = newwin(in_h, cw, cy_avail - in_h, cx0);
     keypad(in_win_, TRUE);
     wtimeout(in_win_, 200);
     
     wrapped_history_.clear();
     for (const auto& raw : raw_history_) {
-        auto wrapped = _wrap_text(raw.text, x - 2);
+        auto wrapped = _wrap_text(raw.text, cw - 2);
         for (const auto& line : wrapped) wrapped_history_.push_back({line, raw.color, raw.type});
     }
 }
@@ -417,10 +420,21 @@ void ProTUI::_render_command_palette() {
 
 void ProTUI::open_editor(const std::string& path) {
     if (path.empty()) { set_status(StatusType::IDLE, "no file to edit (try /edit <path>)"); refresh_ui(true); return; }
+    int y, x; getmaxyx(stdscr, y, x);
+    int ex = 0, ey = 0, ew = x, eh = y;
+    const std::string& dock = editor_dock_;
+    if (dock == "bottom")      { eh = std::max(8, (int)(y * 0.45)); ew = x; ex = 0; ey = y - eh; rsv_bottom_ = eh; }
+    else if (dock == "left")   { ew = std::max(30, (int)(x * 0.5)); eh = y; ex = 0; ey = 0; rsv_left_ = ew; }
+    else if (dock == "right")  { ew = std::max(30, (int)(x * 0.5)); eh = y; ey = 0; ex = x - ew; rsv_right_ = ew; }
+    // "full" reserves nothing and covers the whole screen.
+
+    if (dock != "full") { _setup_windows(); refresh_ui(true); } // draw chat in its reduced area first
     editor_active_.store(true);
-    editor_.run(path);
+    editor_.run(path, ex, ey, ew, eh);
     editor_active_.store(false);
+    rsv_left_ = rsv_right_ = rsv_bottom_ = 0;
     curs_set(0);
+    _setup_windows();
     refresh_ui(true);
 }
 
@@ -567,6 +581,7 @@ void ProTUI::_render_help() {
         {"  ! <cmd>  run a shell command",       "  @path          attach/inject a file"},
         {"  /agenda /tasks  task & calendar view", "  F2             toggle agenda view"},
         {"  /edit <path>    open code editor",     "  F3             edit last agent file"},
+        {"  /editdock l|r|bottom|full  pane side", "  (vim keys: :q quit, i insert)"},
     };
 
     int c2 = w / 2;

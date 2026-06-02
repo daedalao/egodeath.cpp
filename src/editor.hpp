@@ -17,8 +17,9 @@ public:
     void set_save_fn(std::function<std::string(const std::string&, const std::string&)> fn) {
         save_fn_ = std::move(fn);
     }
-    // Opens `path` and runs the modal editor until the user closes it (:q / :q!).
-    void run(const std::string& path);
+    // Opens `path` and runs the modal editor in the rectangle (x,y,w,h) until the
+    // user closes it (:q / :q!).
+    void run(const std::string& path, int x, int y, int w, int h);
 
 private:
     enum class Mode { NORMAL, INSERT };

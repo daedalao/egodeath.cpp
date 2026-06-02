@@ -370,13 +370,13 @@ bool Editor::handle_normal(void* vw, int rows, int cols, int ch, bool& open) {
     return open;
 }
 
-void Editor::run(const std::string& path) {
+void Editor::run(const std::string& path, int x, int y, int ww, int hh) {
     path_ = path;
     load();
     mode_ = Mode::NORMAL;
-    int rows = LINES, cols = COLS;
+    int rows = hh, cols = ww;
     set_escdelay(25);                 // make a lone Esc responsive
-    WINDOW* w = newwin(rows, cols, 0, 0);
+    WINDOW* w = newwin(rows, cols, y, x);
     keypad(w, TRUE);
     wtimeout(w, -1);
     curs_set(1);

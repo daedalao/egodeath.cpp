@@ -78,6 +78,10 @@ public:
     void open_editor(const std::string& path);
     void set_last_file_provider(std::function<std::string()> cb) { last_file_provider_ = std::move(cb); }
     void set_editor_save_fn(std::function<std::string(const std::string&, const std::string&)> cb) { editor_.set_save_fn(std::move(cb)); }
+    void set_editor_dock(const std::string& side) {
+        if (side == "left" || side == "right" || side == "bottom" || side == "full") editor_dock_ = side;
+    }
+    std::string editor_dock() const { return editor_dock_; }
 
     bool is_running() const { return running_; }
     bool is_history_empty() const;  // Check if history is empty (thread-safe)
@@ -172,6 +176,8 @@ private:
     Editor editor_;
     std::atomic<bool> editor_active_{false};
     std::function<std::string()> last_file_provider_;
+    std::string editor_dock_ = "right";
+    int rsv_left_ = 0, rsv_right_ = 0, rsv_bottom_ = 0; // region reserved for the editor pane
     std::string reasoning_effort_ = "medium";
     std::string theme_ = "dark";
     std::map<std::string, std::map<int, std::pair<int,int>>> themes_;
