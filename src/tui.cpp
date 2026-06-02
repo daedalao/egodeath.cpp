@@ -235,9 +235,31 @@ std::vector<std::string> ProTUI::_wrap_text(const std::string& text, int width) 
     return result;
 }
 
+// Strip ANSI escape sequences and stray C0 control bytes so untrusted content
+// (e.g. fetched web pages, shell output) can't corrupt the ncurses display.
+static std::string _sanitize_display(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char ch = (unsigned char)s[i];
+        if (ch == 0x1b) { // ESC: drop a CSI/escape sequence
+            if (i + 1 < s.size() && s[i + 1] == '[') {
+                i += 2;
+                while (i < s.size() && !(s[i] >= '@' && s[i] <= '~')) i++;
+            }
+            continue;
+        }
+        if (ch == 0x7f) continue;                       // DEL
+        if (ch < 0x20 && ch != '\n' && ch != '\t') continue; // other C0 controls
+        out += (char)ch;
+    }
+    return out;
+}
+
 void ProTUI::append_history(const std::string& sender, const std::string& text, const std::string& type) {
     std::lock_guard<std::mutex> lock(mtx_);
-    std::string full = sender.empty() ? text : fmt::format("{} › {}", sender, text);
+    std::string ctext = _sanitize_display(text);
+    std::string full = sender.empty() ? ctext : fmt::format("{} › {}", sender, ctext);
     int color = _get_color_for_type(type);
     raw_history_.push_back({full, color, type});
     if (raw_history_.size() > 500) raw_history_.pop_front();
@@ -266,7 +288,7 @@ void ProTUI::append_last_history(const std::string& chunk) {
     if (remove_from >= 0)
         wrapped_history_.erase(wrapped_history_.begin() + remove_from, wrapped_history_.end());
     // Append chunk and re-wrap just the last entry
-    raw_history_.back().text += chunk;
+    raw_history_.back().text += _sanitize_display(chunk);
     auto& last = raw_history_.back();
     for (const auto& l : _wrap_text(last.text, width))
         wrapped_history_.push_back({l, last.color, last.type});
@@ -690,18 +712,6 @@ void ProTUI::_draw_dashboard() {
 
     std::string perf = fmt::format("pp {:.1f} · gen {:.1f} t/s", metrics_.pp_speed.value_or(0.0), metrics_.gen_speed.value_or(0.0));
     mvwaddstr(dash_win_, 1, x - (int)perf.length() - 2, perf.c_str());
-    {
-        int spark_cells = std::min(14, (int)recent_throughput_.size());
-        if (spark_cells > 1) {
-            int perf_x = x - (int)perf.length() - 2;
-            int spark_x = perf_x - spark_cells - 1;
-            if (spark_x > 74) {
-                wattron(dash_win_, COLOR_PAIR(2));
-                mvwaddstr(dash_win_, 1, spark_x, _get_sparkline(recent_throughput_, spark_cells).c_str());
-                wattroff(dash_win_, COLOR_PAIR(2));
-            }
-        }
-    }
     wnoutrefresh(dash_win_);
 }
 
@@ -1355,20 +1365,15 @@ void ProTUI::_draw_borders() {
 
 void ProTUI::update_reasoning(const std::string& text, bool append) {
     std::lock_guard<std::mutex> lock(mtx_);
-    if (append) current_reasoning_ += text; else current_reasoning_ = text;
+    std::string ctext = _sanitize_display(text);
+    if (append) current_reasoning_ += ctext; else current_reasoning_ = ctext;
 }
 void ProTUI::clear_reasoning() { std::lock_guard<std::mutex> lock(mtx_); current_reasoning_.clear(); reas_scroll_offset_ = 0; }
 void ProTUI::set_metrics(const Metrics& m) {
     std::lock_guard<std::mutex> lock(mtx_);
     // Merge-update: never clear a field that already has a value
     if (m.pp_speed.has_value())  metrics_.pp_speed  = m.pp_speed;
-    if (m.gen_speed.has_value()) {
-        metrics_.gen_speed = m.gen_speed;
-        if (m.gen_speed.value() > 0) {
-            recent_throughput_.push_back(m.gen_speed.value());
-            if (recent_throughput_.size() > 60) recent_throughput_.erase(recent_throughput_.begin());
-        }
-    }
+    if (m.gen_speed.has_value()) metrics_.gen_speed = m.gen_speed;
     if (m.ctx_size.has_value())  metrics_.ctx_size  = m.ctx_size;
     // ctx_used is sticky: only advance, never zero out
     if (m.ctx_used.has_value() && m.ctx_used.value() > 0)
