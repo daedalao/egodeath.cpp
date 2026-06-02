@@ -435,6 +435,20 @@ static std::string validate_tool_call(const json& all_tools, const std::string& 
     return "";
 }
 
+std::string Agent::last_written_file() {
+    std::lock_guard<std::mutex> lk(last_file_mtx_);
+    return last_file_;
+}
+
+std::string Agent::editor_save(const std::string& path, const std::string& content) {
+    checkpoint_file(path);
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return "cannot open " + path + " for writing";
+    out << content;
+    { std::lock_guard<std::mutex> lk(last_file_mtx_); last_file_ = path; }
+    return "";
+}
+
 json Agent::agenda_snapshot() {
     json arr = json::array();
     if (!store_) return arr;
@@ -820,9 +834,11 @@ void Agent::turn_async(int depth) {
                 } else if (name == "write_file") {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);
+                    { std::lock_guard<std::mutex> lk(last_file_mtx_); last_file_ = args.value("filepath", ""); }
                 } else if (name == "edit_file") {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);
+                    { std::lock_guard<std::mutex> lk(last_file_mtx_); last_file_ = args.value("filepath", ""); }
                 } else if (name == "exec_shell" && !shell_enabled_.load()) {
                     res = "error: shell access is disabled (the user can enable it with /shell on)";
                 } else if (mcp_.owns(name)) {

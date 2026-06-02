@@ -30,6 +30,7 @@ add_executable(egodeath
     src/sys_monitor.cpp
     src/mcp.cpp
     src/store.cpp
+    src/editor.cpp
 )
 
 target_link_libraries(egodeath 

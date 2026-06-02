@@ -415,6 +415,15 @@ void ProTUI::_render_command_palette() {
     wnoutrefresh(status_win_);
 }
 
+void ProTUI::open_editor(const std::string& path) {
+    if (path.empty()) { set_status(StatusType::IDLE, "no file to edit (try /edit <path>)"); refresh_ui(true); return; }
+    editor_active_.store(true);
+    editor_.run(path);
+    editor_active_.store(false);
+    curs_set(0);
+    refresh_ui(true);
+}
+
 void ProTUI::open_agenda() {
     input_mode_ = InputMode::AGENDA;
     agenda_sel_ = 0;
@@ -557,6 +566,7 @@ void ProTUI::_render_help() {
         {"  /theme dark|matrix|amber|mono",      "  /exit          quit"},
         {"  ! <cmd>  run a shell command",       "  @path          attach/inject a file"},
         {"  /agenda /tasks  task & calendar view", "  F2             toggle agenda view"},
+        {"  /edit <path>    open code editor",     "  F3             edit last agent file"},
     };
 
     int c2 = w / 2;
@@ -621,6 +631,7 @@ static bool _is_code_fence(const std::string& text) {
 }
 
 void ProTUI::_render_history() {
+    if (editor_active_.load()) return;
     if (!hist_win_) return;
     werase(hist_win_);
     int h = getmaxy(hist_win_);
@@ -958,6 +969,7 @@ void ProTUI::_draw_status() {
 }
 
 void ProTUI::refresh_ui(bool force) {
+    if (editor_active_.load()) return;
     std::lock_guard<std::mutex> lock(mtx_);
     _draw_dashboard(); _draw_status(); _draw_borders(); _render_history(); doupdate();
 }
@@ -1128,6 +1140,10 @@ std::string ProTUI::get_input() {
         if (ch == KEY_F(2)) {
             if (input_mode_ == InputMode::AGENDA) { input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true); }
             else open_agenda();
+            continue;
+        }
+        if (ch == KEY_F(3)) {
+            open_editor(last_file_provider_ ? last_file_provider_() : std::string());
             continue;
         }
         if (input_mode_ == InputMode::AGENDA) {
@@ -1554,6 +1570,7 @@ void ProTUI::_draw_borders() {
 }
 
 void ProTUI::update_reasoning(const std::string& text, bool append) {
+    if (editor_active_.load()) return;
     std::lock_guard<std::mutex> lock(mtx_);
     std::string ctext = _sanitize_display(text);
     if (append) current_reasoning_ += ctext; else current_reasoning_ = ctext;

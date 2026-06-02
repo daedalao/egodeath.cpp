@@ -32,6 +32,8 @@ public:
     std::string mcp_status() const { return mcp_.status(); }
     json agenda_snapshot();
     std::string agenda_action(const std::string& op, long long id, const std::string& arg);
+    std::string last_written_file();
+    std::string editor_save(const std::string& path, const std::string& content);
     void cancel();
     ~Agent();
     
@@ -95,6 +97,8 @@ private:
     Memory memory_;
     McpManager mcp_;
     std::unique_ptr<Store> store_;
+    std::string last_file_;
+    std::mutex last_file_mtx_;
 };
 
 } // namespace egodeath

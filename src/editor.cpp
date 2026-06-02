@@ -1,0 +1,325 @@
+#include "editor.hpp"
+
+#include <ncurses.h>
+#include <fstream>
+#include <sstream>
+#include <unordered_set>
+#include <algorithm>
+#include <cctype>
+
+namespace egodeath {
+
+// Color pairs (defined by the TUI theme): 2=string/green, 3=keyword/yellow,
+// 4=text, 8=preproc/orange, 9=number/blue, 10=dim/comment/linenum.
+enum { C_TEXT = 4, C_KW = 3, C_STR = 2, C_COM = 10, C_NUM = 9, C_PRE = 8, C_DIM = 10 };
+
+static const std::unordered_set<std::string>& keywords(const std::string& lang) {
+    static const std::unordered_set<std::string> cpp = {
+        "alignas","alignof","auto","bool","break","case","catch","char","class","const","constexpr",
+        "continue","default","delete","do","double","else","enum","explicit","extern","false","float",
+        "for","friend","goto","if","inline","int","long","mutable","namespace","new","noexcept","nullptr",
+        "operator","private","protected","public","return","short","signed","sizeof","static","struct",
+        "switch","template","this","throw","true","try","typedef","typename","union","unsigned","using",
+        "virtual","void","volatile","while","size_t","string","vector","include","define","pragma"};
+    static const std::unordered_set<std::string> py = {
+        "def","class","return","if","elif","else","for","while","import","from","as","try","except",
+        "finally","with","lambda","yield","pass","break","continue","global","nonlocal","True","False",
+        "None","and","or","not","in","is","self","raise","assert","del","async","await","print"};
+    static const std::unordered_set<std::string> jsonk = {"true","false","null"};
+    static const std::unordered_set<std::string> empty;
+    if (lang == "cpp") return cpp;
+    if (lang == "py") return py;
+    if (lang == "json") return jsonk;
+    return empty;
+}
+
+void Editor::set_lang_from_ext() {
+    auto dot = path_.find_last_of('.');
+    std::string ext = dot == std::string::npos ? "" : path_.substr(dot + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    if (ext=="c"||ext=="cc"||ext=="cpp"||ext=="cxx"||ext=="h"||ext=="hh"||ext=="hpp"||ext=="hxx"||ext=="ipp")
+        lang_ = "cpp";
+    else if (ext == "py") lang_ = "py";
+    else if (ext == "json") lang_ = "json";
+    else lang_ = "";
+}
+
+void Editor::load() {
+    lines_.clear();
+    std::ifstream in(path_, std::ios::binary);
+    if (in) {
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines_.push_back(line);
+        }
+    }
+    if (lines_.empty()) lines_.push_back("");
+    cy_ = cx_ = top_ = left_ = 0;
+    dirty_ = false;
+    set_lang_from_ext();
+}
+
+std::string Editor::content() const {
+    std::string out;
+    for (size_t i = 0; i < lines_.size(); ++i) { out += lines_[i]; if (i + 1 < lines_.size()) out += '\n'; }
+    out += '\n';
+    return out;
+}
+
+bool Editor::save() {
+    if (!save_fn_) { status_ = "no save handler"; return false; }
+    std::string err = save_fn_(path_, content());
+    if (err.empty()) { dirty_ = false; status_ = "saved " + path_; return true; }
+    status_ = "save failed: " + err;
+    return false;
+}
+
+void Editor::clamp() {
+    if (cy_ < 0) cy_ = 0;
+    if (cy_ >= (int)lines_.size()) cy_ = (int)lines_.size() - 1;
+    if (cx_ < 0) cx_ = 0;
+    if (cx_ > (int)lines_[cy_].size()) cx_ = (int)lines_[cy_].size();
+}
+
+void Editor::ensure_visible(int textrows, int textw, int /*numw*/) {
+    if (cy_ < top_) top_ = cy_;
+    if (cy_ >= top_ + textrows) top_ = cy_ - textrows + 1;
+    if (top_ < 0) top_ = 0;
+    if (cx_ < left_) left_ = cx_;
+    if (cx_ >= left_ + textw) left_ = cx_ - textw + 1;
+    if (left_ < 0) left_ = 0;
+}
+
+// Per-character color for one line. `in_block` tracks /* */ across lines.
+std::vector<int> Editor::highlight(const std::string& s, bool& in_block) const {
+    int n = (int)s.size();
+    std::vector<int> col(n, C_TEXT);
+    if (lang_.empty()) {
+        // strings + numbers only for unknown languages
+    }
+    const auto& kw = keywords(lang_);
+    bool cstyle = (lang_ == "cpp");
+    bool hash_comment = (lang_ == "py");
+    int i = 0;
+    // preprocessor line for C/C++
+    if (cstyle) {
+        int f = 0; while (f < n && (s[f] == ' ' || s[f] == '\t')) f++;
+        if (f < n && s[f] == '#') { for (int k = f; k < n; ++k) col[k] = C_PRE; return col; }
+    }
+    while (i < n) {
+        char c = s[i];
+        if (in_block) {
+            col[i] = C_COM;
+            if (cstyle && c == '*' && i + 1 < n && s[i + 1] == '/') { col[i + 1] = C_COM; i += 2; in_block = false; continue; }
+            i++; continue;
+        }
+        if (cstyle && c == '/' && i + 1 < n && s[i + 1] == '/') { for (int k = i; k < n; ++k) col[k] = C_COM; break; }
+        if (cstyle && c == '/' && i + 1 < n && s[i + 1] == '*') { col[i] = col[i + 1] = C_COM; i += 2; in_block = true; continue; }
+        if (hash_comment && c == '#') { for (int k = i; k < n; ++k) col[k] = C_COM; break; }
+        if (c == '"' || c == '\'') {
+            char q = c; col[i] = C_STR; int j = i + 1;
+            while (j < n) { col[j] = C_STR; if (s[j] == '\\' && j + 1 < n) { col[j + 1] = C_STR; j += 2; continue; } if (s[j] == q) { j++; break; } j++; }
+            i = j; continue;
+        }
+        if (std::isdigit((unsigned char)c) && (i == 0 || !(std::isalnum((unsigned char)s[i - 1]) || s[i - 1] == '_'))) {
+            int j = i; while (j < n && (std::isalnum((unsigned char)s[j]) || s[j] == '.' || s[j] == 'x')) { col[j] = C_NUM; j++; }
+            i = j; continue;
+        }
+        if (std::isalpha((unsigned char)c) || c == '_') {
+            int j = i; while (j < n && (std::isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
+            if (kw.count(s.substr(i, j - i))) for (int k = i; k < j; ++k) col[k] = C_KW;
+            i = j; continue;
+        }
+        i++;
+    }
+    return col;
+}
+
+void Editor::render(void* vw, int rows, int cols) {
+    WINDOW* w = (WINDOW*)vw;
+    werase(w);
+    int textrows = rows - 2;
+    int numw = (int)std::to_string(std::max<size_t>(1, lines_.size())).size() + 1;
+    if (numw < 4) numw = 4;
+    int textw = cols - numw - 1;
+    if (textw < 1) textw = 1;
+    ensure_visible(textrows, textw, numw);
+
+    // Title bar
+    std::string title = " edit: " + path_ + (dirty_ ? "  *" : "");
+    if ((int)title.size() > cols) title = title.substr(0, cols);
+    title.resize(cols, ' ');
+    wattron(w, A_REVERSE | COLOR_PAIR(C_KW));
+    mvwaddstr(w, 0, 0, title.c_str());
+    wattroff(w, A_REVERSE | COLOR_PAIR(C_KW));
+
+    // Recompute block-comment state up to top_
+    bool in_block = false;
+    for (int fy = 0; fy < top_ && fy < (int)lines_.size(); ++fy) { auto _ = highlight(lines_[fy], in_block); (void)_; }
+
+    for (int row = 0; row < textrows; ++row) {
+        int fy = top_ + row, sy = 1 + row;
+        if (fy >= (int)lines_.size()) break;
+        const std::string& line = lines_[fy];
+        // line number
+        std::string ln = std::to_string(fy + 1);
+        std::string lns(numw - 1 - (int)ln.size(), ' '); lns += ln; lns += ' ';
+        wattron(w, COLOR_PAIR(C_DIM));
+        mvwaddstr(w, sy, 0, lns.c_str());
+        wattroff(w, COLOR_PAIR(C_DIM));
+        // highlighted, horizontally-clipped text
+        bool blk = in_block;
+        std::vector<int> col = highlight(line, blk);
+        int start = left_, end = std::min((int)line.size(), left_ + textw);
+        int x = numw;
+        int i = start;
+        while (i < end) {
+            int c = col[i], j = i + 1;
+            while (j < end && col[j] == c) j++;
+            wattron(w, COLOR_PAIR(c));
+            mvwaddnstr(w, sy, x + (i - start), line.c_str() + i, j - i);
+            wattroff(w, COLOR_PAIR(c));
+            i = j;
+        }
+        in_block = blk; // carry block state to next line
+    }
+
+    // Status bar
+    std::string left = " " + std::to_string(cy_ + 1) + ":" + std::to_string(cx_ + 1) +
+                       (dirty_ ? "  modified" : "") + (lang_.empty() ? "" : "  [" + lang_ + "]");
+    std::string right = (status_.empty() ? "^S save  ^F find  ^Q close " : status_ + " ");
+    std::string bar = left;
+    int pad = cols - (int)left.size() - (int)right.size();
+    if (pad > 0) bar += std::string(pad, ' ') + right; else bar = left.substr(0, cols);
+    bar.resize(cols, ' ');
+    wattron(w, A_REVERSE | COLOR_PAIR(C_TEXT));
+    mvwaddstr(w, rows - 1, 0, bar.c_str());
+    wattroff(w, A_REVERSE | COLOR_PAIR(C_TEXT));
+
+    // place the hardware cursor
+    int scy = 1 + (cy_ - top_), scx = numw + (cx_ - left_);
+    wmove(w, scy, scx);
+    wnoutrefresh(w);
+    doupdate();
+}
+
+std::string Editor::prompt(void* vw, int rows, int cols, const std::string& label) {
+    WINDOW* w = (WINDOW*)vw;
+    std::string buf;
+    for (;;) {
+        std::string bar = " " + label + buf;
+        if ((int)bar.size() > cols) bar = bar.substr(bar.size() - cols);
+        bar.resize(cols, ' ');
+        wattron(w, A_REVERSE | COLOR_PAIR(C_PRE));
+        mvwaddstr(w, rows - 1, 0, bar.c_str());
+        wattroff(w, A_REVERSE | COLOR_PAIR(C_PRE));
+        wmove(w, rows - 1, std::min(cols - 1, (int)(1 + label.size() + buf.size())));
+        wnoutrefresh(w); doupdate();
+        int ch = wgetch(w);
+        if (ch == 27) return std::string(1, '\x1b');        // ESC -> sentinel
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) return buf;
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) { if (!buf.empty()) buf.pop_back(); continue; }
+        if (ch >= 32 && ch < 127) buf += (char)ch;
+    }
+}
+
+void Editor::find_next(void* vw, int rows, int cols) {
+    std::string q = prompt(vw, rows, cols, "find: ");
+    if (!q.empty() && q[0] == '\x1b') { status_ = ""; return; }
+    if (q.empty()) q = last_search_;
+    if (q.empty()) { status_ = "no search term"; return; }
+    last_search_ = q;
+    // search from just after the cursor, wrapping once
+    int sy = cy_, sx = cx_ + 1;
+    for (int scanned = 0; scanned <= (int)lines_.size(); ++scanned) {
+        int ly = (sy + scanned) % (int)lines_.size();
+        const std::string& line = lines_[ly];
+        int from = (scanned == 0) ? sx : 0;
+        auto pos = line.find(q, std::max(0, from));
+        if (pos != std::string::npos) {
+            cy_ = ly; cx_ = (int)pos; status_ = "match: " + q;
+            return;
+        }
+    }
+    status_ = "not found: " + q;
+}
+
+void Editor::run(const std::string& path) {
+    path_ = path;
+    load();
+    int rows = LINES, cols = COLS;
+    WINDOW* w = newwin(rows, cols, 0, 0);
+    keypad(w, TRUE);
+    wtimeout(w, -1);
+    curs_set(1);
+
+    bool open = true;
+    while (open) {
+        render(w, rows, cols);
+        int ch = wgetch(w);
+        std::string& line = lines_[cy_];
+        bool was_quit = false;
+
+        switch (ch) {
+            case 17: // Ctrl+Q
+                was_quit = true;
+                if (dirty_ && !quit_armed_) { quit_armed_ = true; status_ = "unsaved changes — ^Q again to discard"; }
+                else open = false;
+                break;
+            case 19: // Ctrl+S
+                save();
+                break;
+            case 6:  // Ctrl+F
+                find_next(w, rows, cols);
+                break;
+            case KEY_UP:    if (cy_ > 0) cy_--; clamp(); break;
+            case KEY_DOWN:  if (cy_ < (int)lines_.size() - 1) cy_++; clamp(); break;
+            case KEY_LEFT:
+                if (cx_ > 0) cx_--;
+                else if (cy_ > 0) { cy_--; cx_ = (int)lines_[cy_].size(); }
+                break;
+            case KEY_RIGHT:
+                if (cx_ < (int)line.size()) cx_++;
+                else if (cy_ < (int)lines_.size() - 1) { cy_++; cx_ = 0; }
+                break;
+            case KEY_HOME: case 1: cx_ = 0; break;
+            case KEY_END:  case 5: cx_ = (int)line.size(); break;
+            case KEY_PPAGE: cy_ -= (rows - 3); clamp(); break;
+            case KEY_NPAGE: cy_ += (rows - 3); clamp(); break;
+            case KEY_BACKSPACE: case 127: case 8:
+                if (cx_ > 0) { line.erase(cx_ - 1, 1); cx_--; dirty_ = true; }
+                else if (cy_ > 0) {
+                    int plen = (int)lines_[cy_ - 1].size();
+                    lines_[cy_ - 1] += line;
+                    lines_.erase(lines_.begin() + cy_);
+                    cy_--; cx_ = plen; dirty_ = true;
+                }
+                break;
+            case KEY_DC:
+                if (cx_ < (int)line.size()) { line.erase(cx_, 1); dirty_ = true; }
+                else if (cy_ < (int)lines_.size() - 1) { line += lines_[cy_ + 1]; lines_.erase(lines_.begin() + cy_ + 1); dirty_ = true; }
+                break;
+            case '\n': case '\r': case KEY_ENTER: {
+                std::string rest = line.substr(cx_);
+                line.erase(cx_);
+                lines_.insert(lines_.begin() + cy_ + 1, rest);
+                cy_++; cx_ = 0; dirty_ = true;
+                break;
+            }
+            case '\t':
+                line.insert(cx_, 4, ' '); cx_ += 4; dirty_ = true;
+                break;
+            default:
+                if (ch >= 32 && ch < 127) { line.insert(cx_, 1, (char)ch); cx_++; dirty_ = true; }
+                break;
+        }
+        if (!was_quit) { quit_armed_ = false; if (ch != 19 && ch != 6) status_.clear(); }
+    }
+
+    curs_set(0);
+    werase(w); wnoutrefresh(w); doupdate();
+    delwin(w);
+}
+
+} // namespace egodeath

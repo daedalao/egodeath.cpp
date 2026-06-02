@@ -113,6 +113,8 @@ int main() {
     tui.set_agenda_action([&](const std::string& op, long long id, const std::string& arg) {
         return agent.agenda_action(op, id, arg);
     });
+    tui.set_editor_save_fn([&](const std::string& p, const std::string& c) { return agent.editor_save(p, c); });
+    tui.set_last_file_provider([&]() { return agent.last_written_file(); });
 
     agent.on_metrics = [&](const json& m) {
         Metrics metrics;
@@ -181,6 +183,17 @@ int main() {
         // Inline slash command: /agenda or /tasks (open the task/calendar view)
         if (input == "/agenda" || input == "/tasks" || input == "/cal" || input == "/calendar") {
             tui.open_agenda();
+            continue;
+        }
+
+        // Inline slash command: /edit [path] (open the modal code editor; no arg = last agent file)
+        if (input.rfind("/edit", 0) == 0) {
+            std::string arg = input.size() > 5 ? input.substr(5) : std::string();
+            while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
+            while (!arg.empty() && arg.back() == ' ') arg.pop_back();
+            if (arg.empty()) arg = agent.last_written_file();
+            if (arg.empty()) { tui.append_history("", "usage: /edit <path>", "system"); continue; }
+            tui.open_editor(arg);
             continue;
         }
 

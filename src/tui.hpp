@@ -2,6 +2,7 @@
 #include <functional>
 #include "common.hpp"
 #include "sys_monitor.hpp"
+#include "editor.hpp"
 #include <deque>
 #include <atomic>
 #include <mutex>
@@ -74,6 +75,9 @@ public:
     void set_agenda_action(std::function<std::string(const std::string&, long long, const std::string&)> cb) { agenda_action_ = std::move(cb); }
     void open_agenda();
     bool agenda_open() const { return input_mode_ == InputMode::AGENDA; }
+    void open_editor(const std::string& path);
+    void set_last_file_provider(std::function<std::string()> cb) { last_file_provider_ = std::move(cb); }
+    void set_editor_save_fn(std::function<std::string(const std::string&, const std::string&)> cb) { editor_.set_save_fn(std::move(cb)); }
 
     bool is_running() const { return running_; }
     bool is_history_empty() const;  // Check if history is empty (thread-safe)
@@ -165,6 +169,9 @@ private:
     json agenda_items_ = json::array();
     std::vector<long long> agenda_order_ids_;
     int agenda_sel_ = 0;
+    Editor editor_;
+    std::atomic<bool> editor_active_{false};
+    std::function<std::string()> last_file_provider_;
     std::string reasoning_effort_ = "medium";
     std::string theme_ = "dark";
     std::map<std::string, std::map<int, std::pair<int,int>>> themes_;
