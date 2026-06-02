@@ -227,6 +227,9 @@ void Agent::process_ui_events() {
                 case UIEvent::Type::METRICS_UPDATE:
                     if (on_metrics) on_metrics(ev.timings);
                     break;
+                case UIEvent::Type::DIFF_DISPLAY:
+                    tui_.append_history("", ev.content, "diff");
+                    break;
                 case UIEvent::Type::TOOL_DISPLAY:
                     tui_.append_history("", ev.content, "tool");
                     break;
@@ -666,7 +669,7 @@ void Agent::turn_async(int depth) {
 
                 // Per-tool approval gate for mutating tools.
                 bool _denied = false;
-                if (((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || mcp_.owns(name)) && !auto_approve_.load()) {
+                if (((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || mcp_.owns(name)) && !auto_approve_.load()) {
                     std::string _aarg;
                     for (const auto& [_k, _v] : args.items()) {
                         if (_k == "command" || _k == "filepath" || _k == "path") {
@@ -675,6 +678,14 @@ void Agent::turn_async(int depth) {
                         }
                     }
                     if (_aarg.size() > 80) _aarg = _aarg.substr(0, 77) + "...";
+                    if (name == "write_file" || name == "edit_file") {
+                        std::string _diff = tools_.preview(name, args);
+                        if (!_diff.empty()) {
+                            std::lock_guard<std::mutex> _dl(ui_queue_mtx_);
+                            UIEvent _dv; _dv.type = UIEvent::Type::DIFF_DISPLAY; _dv.content = _diff;
+                            ui_queue_.push(_dv); ui_queue_cv_.notify_one();
+                        }
+                    }
                     int _r = tui_.request_tool_approval("\u26a0 approve " + name + "?  " + _aarg + "   [y]es  [n]o  [a]lways");
                     if (_r == 2) auto_approve_.store(true);
                     if (_r == 0) _denied = true;
@@ -701,6 +712,9 @@ void Agent::turn_async(int depth) {
                 } else if (name == "web_fetch") {
                     res = web_fetch(args.value("url", ""));
                 } else if (name == "write_file") {
+                    checkpoint_file(args.value("filepath", ""));
+                    res = tools_.dispatch(name, args);
+                } else if (name == "edit_file") {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);
                 } else if (name == "exec_shell" && !shell_enabled_.load()) {

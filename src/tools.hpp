@@ -9,8 +9,12 @@ public:
     json schema();
     std::string dispatch(const std::string& name, const json& args);
 
-    static std::string read_file(const std::filesystem::path& p);
+    static std::string read_file(const std::filesystem::path& p, int offset = 0, int limit = 0);
     static std::string write_file(const std::filesystem::path& p, const std::string& c);
+    static std::string edit_file(const std::filesystem::path& p, const std::string& old_s,
+                                 const std::string& new_s, bool replace_all);
+    static std::string make_diff(const std::string& before, const std::string& after);
+    std::string preview(const std::string& name, const json& args);
     std::string grep_search(const std::string& pat);
     static std::string exec_shell(const std::string& cmd);
     static std::string list_directory(const std::filesystem::path& p);

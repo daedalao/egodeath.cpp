@@ -182,6 +182,7 @@ int ProTUI::_get_color_for_type(const std::string& type) const {
     if (type == "user_queued") return 10; // dim gray
     if (type == "assistant")   return 4;  // white
     if (type == "tool")        return 2;  // green
+    if (type == "diff")        return 10; // per-line override in _render_history
     if (type == "system")      return 1;  // cyan
     return 4;
 }
@@ -605,6 +606,15 @@ void ProTUI::_render_history() {
             wattron(hist_win_, COLOR_PAIR(l.color));
             mvwaddstr(hist_win_, i, 3, l.text.substr(0, std::max(0, _w - 2)).c_str());
             wattroff(hist_win_, COLOR_PAIR(l.color));
+            continue;
+        }
+
+        if (l.type == "diff") {
+            int dc = (!l.text.empty() && l.text[0] == '+') ? 2
+                   : (!l.text.empty() && l.text[0] == '-') ? 7 : 10;
+            wattron(hist_win_, COLOR_PAIR(dc));
+            mvwaddstr(hist_win_, i, 1, l.text.substr(0, _w).c_str());
+            wattroff(hist_win_, COLOR_PAIR(dc));
             continue;
         }
 

@@ -18,8 +18,9 @@ Tools::Tools(std::filesystem::path root) : root_(std::move(root)) {
 
 json Tools::schema() {
     static const json s = json::parse(R"([
-        {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}}}}},
-        {"type": "function", "function": {"name": "write_file", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "read_file", "description": "Read a text file. Optional integer \"offset\" (1-based first line) and \"limit\" (max lines) read just a slice of a large file.", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["filepath"]}}},
+        {"type": "function", "function": {"name": "write_file", "description": "Create a new file or completely overwrite an existing one. To change part of an existing file, prefer edit_file (cheaper and safer).", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}}},
+        {"type": "function", "function": {"name": "edit_file", "description": "Make a precise in-place edit by replacing old_string with new_string. old_string must match the file exactly and be unique unless replace_all is true. Preferred over write_file for existing files.", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}, "required": ["filepath", "old_string", "new_string"]}}},
         {"type": "function", "function": {"name": "grep_search", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}}},
         {"type": "function", "function": {"name": "exec_shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}},
         {"type": "function", "function": {"name": "list_directory", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
@@ -44,12 +45,18 @@ std::string Tools::dispatch(const std::string& name, const json& args) {
     if (name == "read_file") {
         auto p = root_ / args.value("filepath", "");
         if (!is_safe_path(root_, p)) return "error: path outside workspace";
-        return read_file(p);
+        return read_file(p, args.value("offset", 0), args.value("limit", 0));
     }
     if (name == "write_file") {
         auto p = root_ / args.value("filepath", "");
         if (!is_safe_path(root_, p)) return "error: path outside workspace";
         return write_file(p, args.value("content", ""));
+    }
+    if (name == "edit_file") {
+        auto p = root_ / args.value("filepath", "");
+        if (!is_safe_path(root_, p)) return "error: path outside workspace";
+        return edit_file(p, args.value("old_string", ""), args.value("new_string", ""),
+                         args.value("replace_all", false));
     }
     if (name == "grep_search") return grep_search(args.value("pattern", ""));
     if (name == "exec_shell") return exec_shell(args.value("command", ""));
@@ -58,24 +65,123 @@ std::string Tools::dispatch(const std::string& name, const json& args) {
     return "error: unknown tool";
 }
 
-std::string Tools::read_file(const std::filesystem::path& p) {
+std::string Tools::read_file(const std::filesystem::path& p, int offset, int limit) {
     std::ifstream in(p, std::ios::binary);
     if (!in) return "error: could not open file";
     constexpr size_t MAX_BYTES = 512 * 1024;
-    std::string content(MAX_BYTES + 1, '\0');
-    in.read(content.data(), MAX_BYTES + 1);
-    size_t bytes_read = in.gcount();
-    content.resize(bytes_read);
-    if (bytes_read > MAX_BYTES) {
-        content.resize(MAX_BYTES);
-        content += "\n... [truncated at 512KB]";
+    if (offset <= 0 && limit <= 0) {
+        std::string content(MAX_BYTES + 1, '\0');
+        in.read(content.data(), MAX_BYTES + 1);
+        size_t bytes_read = in.gcount();
+        content.resize(bytes_read);
+        if (bytes_read > MAX_BYTES) {
+            content.resize(MAX_BYTES);
+            content += "\n... [truncated at 512KB]";
+        }
+        return content;
     }
-    return content;
+    // Ranged read: lines [offset, offset+limit). offset is 1-based.
+    int start = offset > 0 ? offset : 1;
+    int budget = limit > 0 ? limit : (1 << 30);
+    std::string out, line; int ln = 0, emitted = 0;
+    while (std::getline(in, line)) {
+        if (++ln < start) continue;
+        out += line; out += '\n';
+        if (++emitted >= budget) break;
+        if (out.size() > MAX_BYTES) { out += "... [truncated at 512KB]\n"; break; }
+    }
+    if (out.empty())
+        return fmt::format("(no lines: file has fewer than {} lines)", start);
+    return out;
 }
 
 std::string Tools::write_file(const std::filesystem::path& p, const std::string& c) {
     std::ofstream out(p); if (!out) return "error: could not write file";
     out << c; return "file written";
+}
+
+static std::vector<std::string> _split_lines(const std::string& s) {
+    std::vector<std::string> out; std::string cur;
+    for (char ch : s) { if (ch == '\n') { out.push_back(cur); cur.clear(); } else cur += ch; }
+    out.push_back(cur);
+    return out;
+}
+
+// Localized line diff: trims common head/tail, shows the changed region with 2 lines
+// of context. Removed lines are prefixed "- ", added "+ ", context "  ".
+std::string Tools::make_diff(const std::string& before, const std::string& after) {
+    if (before == after) return "";
+    auto A = _split_lines(before), B = _split_lines(after);
+    size_t p = 0;
+    while (p < A.size() && p < B.size() && A[p] == B[p]) p++;
+    size_t sa = A.size(), sb = B.size();
+    while (sa > p && sb > p && A[sa - 1] == B[sb - 1]) { sa--; sb--; }
+    const int CTX = 2;
+    std::string out;
+    size_t cs = p > (size_t)CTX ? p - CTX : 0;
+    for (size_t i = cs; i < p; i++) out += "  " + A[i] + "\n";
+    int n = 0;
+    for (size_t i = p; i < sa; i++) { out += "- " + A[i] + "\n"; if (++n >= 80) { out += "  ... (more removed)\n"; break; } }
+    n = 0;
+    for (size_t i = p; i < sb; i++) { out += "+ " + B[i] + "\n"; if (++n >= 80) { out += "  ... (more added)\n"; break; } }
+    size_t ce = std::min(A.size(), sa + (size_t)CTX);
+    for (size_t i = sa; i < ce; i++) out += "  " + A[i] + "\n";
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    return out;
+}
+
+std::string Tools::edit_file(const std::filesystem::path& p, const std::string& old_s,
+                             const std::string& new_s, bool replace_all) {
+    if (old_s.empty()) return "error: old_string is empty";
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return "error: could not open file (use write_file to create a new file)";
+    std::stringstream ss; ss << in.rdbuf();
+    std::string content = ss.str(); in.close();
+    size_t count = 0, pos = 0;
+    while ((pos = content.find(old_s, pos)) != std::string::npos) { count++; pos += old_s.size(); }
+    if (count == 0) return "error: old_string not found in file";
+    if (count > 1 && !replace_all)
+        return fmt::format("error: old_string is not unique ({} matches) \u2014 add surrounding "
+                           "context to make it unique, or set replace_all=true", count);
+    size_t n = 0;
+    if (replace_all) {
+        pos = 0;
+        while ((pos = content.find(old_s, pos)) != std::string::npos) {
+            content.replace(pos, old_s.size(), new_s); pos += new_s.size(); n++;
+        }
+    } else {
+        content.replace(content.find(old_s), old_s.size(), new_s); n = 1;
+    }
+    std::ofstream out(p, std::ios::binary);
+    if (!out) return "error: could not write file";
+    out << content;
+    return fmt::format("edited {} ({} replacement{})", p.filename().string(), n, n == 1 ? "" : "s");
+}
+
+std::string Tools::preview(const std::string& name, const json& args) {
+    auto p = root_ / args.value("filepath", "");
+    if (!is_safe_path(root_, p)) return "";
+    std::string before;
+    { std::ifstream in(p, std::ios::binary); if (in) { std::stringstream ss; ss << in.rdbuf(); before = ss.str(); } }
+    std::string after;
+    if (name == "write_file") {
+        after = args.value("content", "");
+    } else if (name == "edit_file") {
+        std::string old_s = args.value("old_string", ""), new_s = args.value("new_string", "");
+        if (old_s.empty() || before.find(old_s) == std::string::npos)
+            return "(no preview \u2014 old_string not found; the edit will report an error)";
+        after = before;
+        if (args.value("replace_all", false)) {
+            size_t pos = 0;
+            while ((pos = after.find(old_s, pos)) != std::string::npos) { after.replace(pos, old_s.size(), new_s); pos += new_s.size(); }
+        } else {
+            after.replace(after.find(old_s), old_s.size(), new_s);
+        }
+    } else {
+        return "";
+    }
+    std::string d = make_diff(before, after);
+    return d.empty() ? "(no changes)" : d;
 }
 
 std::string Tools::grep_search(const std::string& pat) {
