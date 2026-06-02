@@ -4,6 +4,7 @@
 #include "tools.hpp"
 #include "tui.hpp"
 #include "memory.hpp"
+#include "mcp.hpp"
 
 #include <queue>
 #include <condition_variable>
@@ -18,11 +19,14 @@ public:
     int get_context_size() const;
     void set_reasoning_effort(const std::string& e);
     void set_auto_approve(bool b) { auto_approve_.store(b); }
+    void set_shell_enabled(bool b) { shell_enabled_.store(b); }
+    bool shell_enabled() const { return shell_enabled_.load(); }
     void set_ctx_size(int n) { ctx_size_ = n; }
     void set_web_enabled(bool b) { web_enabled_.store(b); }
     bool web_enabled() const { return web_enabled_.load(); }
     void set_searxng_url(const std::string& u) { searxng_url_ = u; }
     std::string undo_last_edit();
+    std::string mcp_status() const { return mcp_.status(); }
     void cancel();
     ~Agent();
     
@@ -51,6 +55,7 @@ private:
     std::atomic<bool> turn_running_{false}; // true while turn_async(0) is executing
     std::atomic<bool> cancel_requested_{false};
     std::atomic<bool> auto_approve_{false};
+    std::atomic<bool> shell_enabled_{false};
     int ctx_size_ = 0;
     std::atomic<bool> web_enabled_{false};
     std::string searxng_url_;
@@ -82,6 +87,7 @@ private:
     void rebuild_tui_from_history();
 
     Memory memory_;
+    McpManager mcp_;
 };
 
 } // namespace egodeath

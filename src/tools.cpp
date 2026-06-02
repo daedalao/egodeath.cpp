@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <fnmatch.h>
 #include <cstring>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 namespace egodeath {
 
@@ -48,10 +51,10 @@ std::string Tools::dispatch(const std::string& name, const json& args) {
         if (!is_safe_path(root_, p)) return "error: path outside workspace";
         return write_file(p, args.value("content", ""));
     }
-    if (name == "grep_search") return grep_search(args.value("pattern", ""), root_);
+    if (name == "grep_search") return grep_search(args.value("pattern", ""));
     if (name == "exec_shell") return exec_shell(args.value("command", ""));
     if (name == "list_directory") return list_directory(root_ / args.value("path", "."));
-    if (name == "glob_search") return glob_search(args.value("pattern", ""), root_);
+    if (name == "glob_search") return glob_search(args.value("pattern", ""));
     return "error: unknown tool";
 }
 
@@ -75,39 +78,66 @@ std::string Tools::write_file(const std::filesystem::path& p, const std::string&
     out << c; return "file written";
 }
 
-std::string Tools::grep_search(const std::string& pat, const std::filesystem::path& root) {
-    std::string res; std::regex re;
+std::string Tools::grep_search(const std::string& pat) {
+    std::regex re;
     try { re = std::regex(pat); } catch (...) { return "error: invalid regex"; }
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-        if (entry.is_regular_file()) {
-            {
-                std::ifstream probe(entry.path(), std::ios::binary);
-                char buf[512];
-                std::streamsize n = probe.read(buf, sizeof(buf)).gcount();
-                if (n > 0 && std::memchr(buf, '\0', n) != nullptr) continue;
+    namespace fs = std::filesystem;
+    std::string res; int matches = 0; std::error_code ec;
+    fs::recursive_directory_iterator it(root_, fs::directory_options::skip_permission_denied, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const auto& entry = *it;
+        std::error_code dec;
+        if (entry.is_directory(dec)) {
+            if (ignored_patterns_.count(entry.path().filename().string()))
+                it.disable_recursion_pending();
+            continue;
+        }
+        if (!entry.is_regular_file(dec)) continue;
+        {
+            std::ifstream probe(entry.path(), std::ios::binary);
+            char b[512];
+            std::streamsize n = probe.read(b, sizeof(b)).gcount();
+            if (n > 0 && std::memchr(b, '\0', (size_t)n) != nullptr) continue;
+        }
+        std::error_code rec;
+        std::string rel = fs::relative(entry.path(), root_, rec).string();
+        if (rec || rel.empty()) rel = entry.path().string();
+        std::ifstream in(entry.path()); std::string line; int ln = 1;
+        while (std::getline(in, line)) {
+            if (std::regex_search(line, re)) {
+                res += fmt::format("{}:{} {}\n", rel, ln, line);
+                if (++matches >= 500) return res + "... [truncated at 500 matches]\n";
             }
-            std::ifstream in(entry.path()); std::string line; int ln = 1;
-            while (std::getline(in, line)) {
-                if (std::regex_search(line, re)) res += fmt::format("{}:{} {}\n", entry.path().filename().string(), ln, line);
-                ln++;
-            }
+            ln++;
         }
     }
     return res.empty() ? "no matches" : res;
 }
 
 std::string Tools::exec_shell(const std::string& cmd) {
-    std::array<char, 128> buffer;
-    std::string result;
-    // Wrap in a subshell and redirect stderr→stdout so error messages are
-    // captured as tool output instead of leaking to the raw terminal and
-    // corrupting the ncurses display.
-    std::string safe_cmd = "{ " + cmd + "; } 2>&1";
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(safe_cmd.c_str(), "r"), pclose);
-    if (!pipe) return "error: popen failed";
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return "error: pipe failed";
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return "error: fork failed"; }
+    if (pid == 0) {
+        // Child: route stdout AND stderr into the pipe; read stdin from /dev/null.
+        // Passing cmd as a single argument to `sh -c` keeps multi-line scripts and
+        // heredocs intact, and because stderr goes to the pipe (never the inherited
+        // terminal) a shell syntax error can no longer corrupt the ncurses display.
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        int dn = open("/dev/null", O_RDONLY);
+        if (dn >= 0) { dup2(dn, STDIN_FILENO); close(dn); }
+        close(pipefd[0]); close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
+        _exit(127);
     }
+    close(pipefd[1]);
+    std::string result; char buf[4096]; ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) result.append(buf, (size_t)n);
+    close(pipefd[0]);
+    int status = 0; waitpid(pid, &status, 0);
+    if (result.size() > 512 * 1024) { result.resize(512 * 1024); result += "\n... [truncated at 512KB]"; }
     return result.empty() ? "(empty output)" : result;
 }
 
@@ -121,11 +151,27 @@ std::string Tools::list_directory(const std::filesystem::path& p) {
     return res.empty() ? "(empty directory)" : res;
 }
 
-std::string Tools::glob_search(const std::string& pattern, const std::filesystem::path& root) {
-    std::string res;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-        if (fnmatch(pattern.c_str(), entry.path().filename().string().c_str(), 0) == 0) {
-            res += entry.path().relative_path().string() + "\n";
+std::string Tools::glob_search(const std::string& pattern) {
+    namespace fs = std::filesystem;
+    std::string res; int count = 0; std::error_code ec;
+    fs::recursive_directory_iterator it(root_, fs::directory_options::skip_permission_denied, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const auto& entry = *it;
+        std::error_code dec;
+        if (entry.is_directory(dec)) {
+            if (ignored_patterns_.count(entry.path().filename().string()))
+                it.disable_recursion_pending();
+            continue;
+        }
+        if (!entry.is_regular_file(dec)) continue;
+        std::error_code rec;
+        std::string rel = fs::relative(entry.path(), root_, rec).string();
+        if (rec) continue;
+        bool m = fnmatch(pattern.c_str(), entry.path().filename().string().c_str(), 0) == 0
+              || fnmatch(pattern.c_str(), rel.c_str(), FNM_PATHNAME) == 0;
+        if (m) {
+            res += rel + "\n";
+            if (++count >= 1000) return res + "... [truncated at 1000 files]\n";
         }
     }
     return res.empty() ? "no matches" : res;
