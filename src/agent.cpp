@@ -45,10 +45,10 @@ Agent::Agent(LlamaClient::Config cfg, ProTUI& tui, std::filesystem::path project
     // Open the SQLite task/calendar store under the XDG config dir.
     {
         namespace fs = std::filesystem;
-        fs::path cdir = std::getenv("XDG_CONFIG_HOME")
+        config_dir_ = std::getenv("XDG_CONFIG_HOME")
             ? fs::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
             : fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".config" / "egodeath";
-        store_ = std::make_unique<Store>(cdir / "egodeath.db");
+        store_ = std::make_unique<Store>(config_dir_ / "egodeath.db");
     }
 
     // Connect any configured MCP servers (EGODEATH_MCP_CONFIG, else .egodeath/mcp.json).
@@ -435,6 +435,21 @@ static std::string validate_tool_call(const json& all_tools, const std::string& 
     return "";
 }
 
+json Agent::read_config() {
+    std::ifstream f(config_dir_ / "config.json");
+    if (!f) return json::object();
+    try { std::stringstream ss; ss << f.rdbuf(); json j = json::parse(ss.str()); return j.is_object() ? j : json::object(); }
+    catch (...) { return json::object(); }
+}
+
+std::string Agent::write_config(const json& cfg) {
+    std::error_code ec; std::filesystem::create_directories(config_dir_, ec);
+    std::ofstream o(config_dir_ / "config.json");
+    if (!o) return "cannot write config.json";
+    o << cfg.dump(2) << "\n";
+    return "";
+}
+
 std::string Agent::last_written_file() {
     std::lock_guard<std::mutex> lk(last_file_mtx_);
     return last_file_;
@@ -603,6 +618,9 @@ void Agent::turn_async(int depth) {
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_items","description":"List tasks and/or events from the store. Defaults to open items.","parameters":{"type":"object","properties":{"kind":{"type":"string","description":"task, event, or all (default all)"},"status":{"type":"string","description":"open, done, cancelled, or all (default open)"},"from":{"type":"string","description":"Earliest date YYYY-MM-DD (optional)"},"to":{"type":"string","description":"Latest date YYYY-MM-DD (optional)"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"complete_item","description":"Mark a task or event done by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_item","description":"Delete a task or event by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"open_editor","description":"Open a file in the in-app code editor so the user can view or edit it. The pane appears in the user\u0027s TUI.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path to open"}},"required":["path"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"get_settings","description":"Return the user\u0027s persisted settings from config.json.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"set_setting","description":"Change one setting and persist it to config.json. Live-applies theme, editor_dock, web_search, shell, auto_approve, reasoning_effort, compact_at; endpoint/model/ctx take effect on restart.","parameters":{"type":"object","properties":{"key":{"type":"string","description":"Setting name, e.g. theme, editor_dock, web_search, shell, auto_approve, reasoning_effort, compact_at"},"value":{"description":"New value (string, boolean, or number depending on the setting)"}},"required":["key","value"]}}})SCHEMA"));
     if (web_enabled_.load()) {
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_search","description":"Search the web via a local SearXNG instance. Returns ranked results with titles, URLs, and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"How many results to return (default 5, max 15)"}},"required":["query"]}}})SCHEMA"));
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its readable text content (HTML stripped). Use after web_search to read a result page.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"Absolute http(s) URL to fetch"}},"required":["url"]}}})SCHEMA"));
@@ -761,7 +779,7 @@ void Agent::turn_async(int depth) {
 
                 // Per-tool approval gate for mutating tools (skipped for invalid calls).
                 bool _denied = false;
-                if (_verr.empty() && ((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || mcp_.owns(name)) && !auto_approve_.load()) {
+                if (_verr.empty() && ((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || name == "set_setting" || mcp_.owns(name)) && !auto_approve_.load()) {
                     std::string _aarg;
                     for (const auto& [_k, _v] : args.items()) {
                         if (_k == "command" || _k == "filepath" || _k == "path") {
@@ -831,6 +849,56 @@ void Agent::turn_async(int depth) {
                 } else if (name == "remove_item") {
                     std::string e; bool ok = store_ && store_->remove(json_id(args), e);
                     res = ok ? "removed" : "error: " + e;
+                } else if (name == "open_editor") {
+                    std::string p = args.value("path", "");
+                    if (p.empty()) res = "error: path required";
+                    else { tui_.request_open_editor(p); res = "opening editor for " + p + " (it appears in the user's TUI)"; }
+                } else if (name == "get_settings") {
+                    json cfg = read_config();
+                    res = cfg.empty() ? "(no settings saved yet)" : cfg.dump(2);
+                } else if (name == "set_setting") {
+                    std::string key = args.value("key", "");
+                    json val = args.contains("value") ? args["value"] : json();
+                    auto is_key = [&](std::initializer_list<const char*> l) { for (auto* s : l) if (key == s) return true; return false; };
+                    std::string err;
+                    // Coerce/validate the value per setting so a stray type can't corrupt config.json.
+                    if (key.empty()) err = "key required";
+                    else if (is_key({"theme", "editor_dock", "reasoning_effort", "model", "endpoint", "searxng_url"})) {
+                        if (!val.is_string()) err = "value for '" + key + "' must be a string";
+                    } else if (is_key({"web_search", "shell", "auto_approve", "cache_prompt"})) {
+                        bool b = false, ok = true;
+                        if (val.is_boolean()) b = val.get<bool>();
+                        else if (val.is_number()) b = val.get<double>() != 0;
+                        else if (val.is_string()) {
+                            std::string s = val.get<std::string>();
+                            for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+                            if (s == "true" || s == "on" || s == "1" || s == "yes") b = true;
+                            else if (s == "false" || s == "off" || s == "0" || s == "no") b = false;
+                            else ok = false;
+                        } else ok = false;
+                        if (!ok) err = "value for '" + key + "' must be true or false";
+                        else val = b;
+                    } else if (key == "compact_at") {
+                        if (val.is_string()) { try { val = std::stod(val.get<std::string>()); } catch (...) { err = "compact_at must be a number"; } }
+                        else if (!val.is_number()) err = "compact_at must be a number";
+                    }
+                    if (!err.empty()) { res = "error: " + err; }
+                    else {
+                        json cfg = read_config(); cfg[key] = val;
+                        std::string werr = write_config(cfg);
+                        if (!werr.empty()) res = "error: " + werr;
+                        else {
+                            std::string applied = "saved (takes effect on restart)";
+                            if (key == "theme") { tui_.set_theme(val.get<std::string>()); applied = "applied live"; }
+                            else if (key == "editor_dock") { tui_.set_editor_dock(val.get<std::string>()); applied = "applied live"; }
+                            else if (key == "web_search") { set_web_enabled(val.get<bool>()); applied = "applied live"; }
+                            else if (key == "shell") { set_shell_enabled(val.get<bool>()); applied = "applied live"; }
+                            else if (key == "auto_approve") { set_auto_approve(val.get<bool>()); applied = "applied live"; }
+                            else if (key == "reasoning_effort") { set_reasoning_effort(val.get<std::string>()); applied = "applied live"; }
+                            else if (key == "compact_at") { double d = val.get<double>(); if (d < 0.3) d = 0.3; if (d > 0.95) d = 0.95; set_compact_at(d); applied = "applied live"; }
+                            res = "setting '" + key + "' = " + val.dump() + " (" + applied + ")";
+                        }
+                    }
                 } else if (name == "write_file") {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);

@@ -97,6 +97,9 @@ private:
     Memory memory_;
     McpManager mcp_;
     std::unique_ptr<Store> store_;
+    std::filesystem::path config_dir_;
+    json read_config();
+    std::string write_config(const json& cfg);
     std::string last_file_;
     std::mutex last_file_mtx_;
 };

@@ -1114,6 +1114,12 @@ std::string ProTUI::get_input() {
         
         ch = wgetch(in_win_);
         if (ch == ERR) {
+            // Agent-requested editor open (set from a background tool call).
+            if (input_mode_ == InputMode::NORMAL && !editor_active_.load() && !approval_pending_.load()) {
+                std::string ep;
+                { std::lock_guard<std::mutex> lk(pending_editor_mtx_); ep.swap(pending_editor_path_); }
+                if (!ep.empty()) { open_editor(ep); continue; }
+            }
             int sc = s_sigint_count.load();
             if (sc >= 1) {
                 long long now = std::chrono::steady_clock::now().time_since_epoch().count();

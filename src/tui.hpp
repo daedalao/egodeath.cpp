@@ -82,6 +82,11 @@ public:
         if (side == "left" || side == "right" || side == "bottom" || side == "full") editor_dock_ = side;
     }
     std::string editor_dock() const { return editor_dock_; }
+    // Thread-safe: a background thread (the agent) asks the main input loop to open the editor.
+    void request_open_editor(const std::string& path) {
+        std::lock_guard<std::mutex> lk(pending_editor_mtx_);
+        pending_editor_path_ = path;
+    }
 
     bool is_running() const { return running_; }
     bool is_history_empty() const;  // Check if history is empty (thread-safe)
@@ -178,6 +183,8 @@ private:
     std::function<std::string()> last_file_provider_;
     std::string editor_dock_ = "right";
     int rsv_left_ = 0, rsv_right_ = 0, rsv_bottom_ = 0; // region reserved for the editor pane
+    std::string pending_editor_path_;
+    std::mutex pending_editor_mtx_;
     std::string reasoning_effort_ = "medium";
     std::string theme_ = "dark";
     std::map<std::string, std::map<int, std::pair<int,int>>> themes_;
