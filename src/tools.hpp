@@ -11,10 +11,10 @@ public:
 
     static std::string read_file(const std::filesystem::path& p);
     static std::string write_file(const std::filesystem::path& p, const std::string& c);
-    static std::string grep_search(const std::string& pat, const std::filesystem::path& root);
+    std::string grep_search(const std::string& pat);
     static std::string exec_shell(const std::string& cmd);
     static std::string list_directory(const std::filesystem::path& p);
-    static std::string glob_search(const std::string& pattern, const std::filesystem::path& root);
+    std::string glob_search(const std::string& pattern);
 
 private:
     std::filesystem::path root_;

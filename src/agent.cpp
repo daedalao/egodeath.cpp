@@ -41,6 +41,22 @@ Agent::Agent(LlamaClient::Config cfg, ProTUI& tui, std::filesystem::path project
     }
     std::string sys_prompt = base_prompt + memory_.system_prompt_addendum();
     history.push_back({{"role", "system"}, {"content", sys_prompt}});
+
+    // Connect any configured MCP servers (EGODEATH_MCP_CONFIG, else .egodeath/mcp.json).
+    {
+        namespace fs = std::filesystem;
+        fs::path cfg;
+        if (const char* e = std::getenv("EGODEATH_MCP_CONFIG")) cfg = e;
+        else if (fs::exists(fs::current_path() / ".egodeath" / "mcp.json"))
+            cfg = fs::current_path() / ".egodeath" / "mcp.json";
+        else {
+            fs::path cdir = std::getenv("XDG_CONFIG_HOME")
+                ? fs::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
+                : fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".config" / "egodeath";
+            if (fs::exists(cdir / "mcp.json")) cfg = cdir / "mcp.json";
+        }
+        if (!cfg.empty()) { mcp_.load_config(cfg); mcp_.connect_all(); }
+    }
     
     // Start UI event processing worker
     ui_worker_ = std::thread([this]() {
@@ -484,6 +500,13 @@ void Agent::turn_async(int depth) {
     bool is_first = true;
     
     json all_tools = tools_.schema();
+    if (!shell_enabled_.load()) {
+        json _filt = json::array();
+        for (auto& _t : all_tools)
+            if (!(_t.contains("function") && _t["function"].value("name", std::string()) == "exec_shell"))
+                _filt.push_back(_t);
+        all_tools = _filt;
+    }
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"save_memory","description":"Persist a fact to long-term memory across sessions.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Short unique slug"},"description":{"type":"string","description":"One-line summary of what this memory contains"},"fact":{"type":"string","description":"The content to store"},"type":{"type":"string","description":"Category: user, project, feedback, or reference"},"scope":{"type":"string","description":"global or project, defaults to global"}},"required":["name","description","fact"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"recall_memory","description":"Retrieve memories. Use an empty query string to get ALL memories. Pass keywords to filter by name or description.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Keyword filter. Empty string returns all memories."},"scope":{"type":"string","description":"all, global, or project. defaults to all"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_memory","description":"Delete a memory entry by its name slug.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The name slug of the memory to delete"}},"required":["name"]}}})SCHEMA"));
@@ -491,6 +514,7 @@ void Agent::turn_async(int depth) {
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_search","description":"Search the web via a local SearXNG instance. Returns ranked results with titles, URLs, and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"How many results to return (default 5, max 15)"}},"required":["query"]}}})SCHEMA"));
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its readable text content (HTML stripped). Use after web_search to read a result page.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"Absolute http(s) URL to fetch"}},"required":["url"]}}})SCHEMA"));
     }
+    for (auto& _mt : mcp_.all_tool_schemas()) all_tools.push_back(_mt);
     auto stream_start = std::chrono::steady_clock::now();
     int gen_token_count = 0;
     auto last_metrics_push = stream_start;
@@ -642,7 +666,7 @@ void Agent::turn_async(int depth) {
 
                 // Per-tool approval gate for mutating tools.
                 bool _denied = false;
-                if ((name == "exec_shell" || name == "write_file") && !auto_approve_.load()) {
+                if (((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || mcp_.owns(name)) && !auto_approve_.load()) {
                     std::string _aarg;
                     for (const auto& [_k, _v] : args.items()) {
                         if (_k == "command" || _k == "filepath" || _k == "path") {
@@ -679,6 +703,10 @@ void Agent::turn_async(int depth) {
                 } else if (name == "write_file") {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);
+                } else if (name == "exec_shell" && !shell_enabled_.load()) {
+                    res = "error: shell access is disabled (the user can enable it with /shell on)";
+                } else if (mcp_.owns(name)) {
+                    res = mcp_.call(name, args);
                 } else {
                     res = tools_.dispatch(name, args);
                 }
