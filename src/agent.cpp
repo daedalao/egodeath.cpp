@@ -427,7 +427,7 @@ void Agent::maybe_compress_history() {
         n = (int)history.size();
         for (const auto& msg : history) est += (int)(msg.dump().size() / 4);
     }
-    if (est < (int)(0.85 * ctx_size_) || n < 12) return;
+    if (est < (int)(compact_at_ * ctx_size_) || n < 12) return;
 
     // Pick a cut that keeps the system message plus a recent tail beginning on a
     // user turn, so no tool message is orphaned from its assistant tool_calls.

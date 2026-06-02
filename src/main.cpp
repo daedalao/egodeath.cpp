@@ -69,6 +69,12 @@ int main() {
     // Fetch context window size from server once at startup
     int ctx_size = agent.get_context_size();
     agent.set_ctx_size(ctx_size);
+    {
+        double ca = (prefs.contains("compact_at") && prefs["compact_at"].is_number())
+                        ? prefs["compact_at"].get<double>() : 0.85;
+        if (ca < 0.3) ca = 0.3; if (ca > 0.95) ca = 0.95;
+        agent.set_compact_at(ca);
+    }
     // Feature toggles: config.json is the base, env vars override.
     agent.set_searxng_url(pref_str("searxng_url", "http://127.0.0.1:8888"));
     agent.set_web_enabled(pref_bool("web_search", false));
@@ -211,22 +217,19 @@ int main() {
             continue;
         }
 
-        // Inline slash command: /theme [dark|matrix|amber|mono] (no arg = cycle)
+        // Inline slash command: /theme [name] (no arg = cycle; custom themes from config)
         if (input.rfind("/theme", 0) == 0) {
             std::string arg = input.size() > 6 ? input.substr(6) : std::string();
             while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
             while (!arg.empty() && arg.back() == ' ') arg.pop_back();
-            const std::vector<std::string> order = {"dark", "matrix", "amber", "mono"};
             if (arg.empty()) {
-                std::string cur = tui.current_theme(); int idx = 0;
-                for (int k = 0; k < (int)order.size(); k++) if (order[k] == cur) idx = k;
-                arg = order[(idx + 1) % order.size()];
-            }
-            if (std::find(order.begin(), order.end(), arg) != order.end()) {
+                tui.cycle_theme();
+                tui.append_history("", "theme: " + tui.current_theme(), "system");
+            } else if (tui.has_theme(arg)) {
                 tui.set_theme(arg);
                 tui.append_history("", "theme: " + arg, "system");
             } else {
-                tui.append_history("", "usage: /theme [dark|matrix|amber|mono]", "system");
+                tui.append_history("", "unknown theme: " + arg + " (custom themes go in ~/.config/egodeath/themes.json)", "system");
             }
             continue;
         }

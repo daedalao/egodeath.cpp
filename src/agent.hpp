@@ -22,6 +22,7 @@ public:
     void set_shell_enabled(bool b) { shell_enabled_.store(b); }
     bool shell_enabled() const { return shell_enabled_.load(); }
     void set_ctx_size(int n) { ctx_size_ = n; }
+    void set_compact_at(double f) { compact_at_ = f; }
     void set_web_enabled(bool b) { web_enabled_.store(b); }
     bool web_enabled() const { return web_enabled_.load(); }
     void set_searxng_url(const std::string& u) { searxng_url_ = u; }
@@ -57,6 +58,7 @@ private:
     std::atomic<bool> auto_approve_{false};
     std::atomic<bool> shell_enabled_{false};
     int ctx_size_ = 0;
+    double compact_at_ = 0.85;
     std::atomic<bool> web_enabled_{false};
     std::string searxng_url_;
     struct FileCheckpoint { std::filesystem::path path; bool existed = false; std::string prior; };

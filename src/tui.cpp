@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
+#include <sstream>
 #include <vector>
 
 namespace egodeath {
@@ -92,33 +93,57 @@ void ProTUI::init() {
     init_pair(10, 242, -1); // user_queued: dim gray, no background
     init_pair(11, 46, 235);  // code block: bright green on dark gray
 
+    _load_themes();
+    _apply_theme(theme_);
     _setup_windows();
     running_ = true;
 }
 
 void ProTUI::_apply_theme(const std::string& name) {
-    theme_ = name;
-    if (name == "matrix") {
-        init_pair(1, 34, -1);  init_pair(2, 46, -1);  init_pair(3, 82, -1);
-        init_pair(4, 120, -1); init_pair(5, 0, 46);   init_pair(6, 22, -1);
-        init_pair(7, 196, -1); init_pair(8, 190, -1); init_pair(9, 28, -1);
-        init_pair(10, 238, -1); init_pair(11, 46, 233);
-    } else if (name == "amber") {
-        init_pair(1, 130, -1); init_pair(2, 178, -1); init_pair(3, 220, -1);
-        init_pair(4, 222, -1); init_pair(5, 0, 214);  init_pair(6, 166, -1);
-        init_pair(7, 196, -1); init_pair(8, 208, -1); init_pair(9, 94, -1);
-        init_pair(10, 240, -1); init_pair(11, 220, 235);
-    } else if (name == "mono") {
-        init_pair(1, 245, -1); init_pair(2, 250, -1); init_pair(3, 252, -1);
-        init_pair(4, 253, -1); init_pair(5, 0, 250);  init_pair(6, 244, -1);
-        init_pair(7, 203, -1); init_pair(8, 247, -1); init_pair(9, 240, -1);
-        init_pair(10, 240, -1); init_pair(11, 252, 236);
-    } else {
-        theme_ = "dark";
-        init_pair(1, COLOR_CYAN, -1); init_pair(2, 46, -1);  init_pair(3, 226, -1);
-        init_pair(4, 255, -1); init_pair(5, 0, 252);  init_pair(6, 160, -1);
-        init_pair(7, 196, -1); init_pair(8, 214, -1); init_pair(9, 27, -1);
-        init_pair(10, 242, -1); init_pair(11, 46, 235);
+    auto it = themes_.find(name);
+    if (it == themes_.end()) it = themes_.find("dark");
+    if (it == themes_.end()) return;
+    theme_ = it->first;
+    for (const auto& [idx, fb] : it->second)
+        init_pair((short)idx, (short)fb.first, (short)fb.second);
+}
+
+void ProTUI::_load_themes() {
+    themes_.clear(); theme_order_.clear();
+    auto add = [&](const std::string& nm, std::map<int, std::pair<int,int>> p) {
+        themes_[nm] = std::move(p); theme_order_.push_back(nm);
+    };
+    add("dark",   {{1,{COLOR_CYAN,-1}},{2,{46,-1}},{3,{226,-1}},{4,{255,-1}},{5,{0,252}},{6,{160,-1}},{7,{196,-1}},{8,{214,-1}},{9,{27,-1}},{10,{242,-1}},{11,{46,235}}});
+    add("matrix", {{1,{34,-1}},{2,{46,-1}},{3,{82,-1}},{4,{120,-1}},{5,{0,46}},{6,{22,-1}},{7,{196,-1}},{8,{190,-1}},{9,{28,-1}},{10,{238,-1}},{11,{46,233}}});
+    add("amber",  {{1,{130,-1}},{2,{178,-1}},{3,{220,-1}},{4,{222,-1}},{5,{0,214}},{6,{166,-1}},{7,{196,-1}},{8,{208,-1}},{9,{94,-1}},{10,{240,-1}},{11,{220,235}}});
+    add("mono",   {{1,{245,-1}},{2,{250,-1}},{3,{252,-1}},{4,{253,-1}},{5,{0,250}},{6,{244,-1}},{7,{203,-1}},{8,{247,-1}},{9,{240,-1}},{10,{240,-1}},{11,{252,236}}});
+
+    namespace fs = std::filesystem;
+    fs::path cdir = std::getenv("XDG_CONFIG_HOME")
+        ? fs::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
+        : fs::path(std::getenv("HOME") ? std::getenv("HOME") : ".") / ".config" / "egodeath";
+    std::ifstream tf(cdir / "themes.json");
+    if (!tf) return;
+    json doc;
+    try { std::stringstream ss; ss << tf.rdbuf(); doc = json::parse(ss.str()); } catch (...) { return; }
+    if (!doc.is_object()) return;
+
+    static const std::map<std::string,int> roles = {
+        {"border",1},{"tool",2},{"accent",3},{"text",4},{"user",5},
+        {"alt",6},{"error",7},{"highlight",8},{"selection",9},{"dim",10},{"code",11}
+    };
+    for (auto& [nm, def] : doc.items()) {
+        if (!def.is_object()) continue;
+        std::map<int, std::pair<int,int>> p = themes_["dark"]; // inherit dark as base
+        for (auto& [role, val] : def.items()) {
+            auto ri = roles.find(role);
+            if (ri == roles.end()) continue;
+            if (val.is_array() && val.size() >= 2 && val[0].is_number_integer() && val[1].is_number_integer())
+                p[ri->second] = { val[0].get<int>(), val[1].get<int>() };
+        }
+        bool isNew = !themes_.count(nm);
+        themes_[nm] = std::move(p);
+        if (isNew) theme_order_.push_back(nm);
     }
 }
 
@@ -126,6 +151,15 @@ void ProTUI::set_theme(const std::string& name) {
     _apply_theme(name);
     refresh_ui(true);
 }
+
+void ProTUI::cycle_theme() {
+    if (theme_order_.empty()) return;
+    int idx = 0;
+    for (int i = 0; i < (int)theme_order_.size(); ++i) if (theme_order_[i] == theme_) idx = i;
+    set_theme(theme_order_[(idx + 1) % theme_order_.size()]);
+}
+
+bool ProTUI::has_theme(const std::string& name) const { return themes_.count(name) > 0; }
 
 void ProTUI::clear_history() {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -1094,9 +1128,7 @@ std::string ProTUI::get_input() {
                             set_status(StatusType::PROCESSING, "reasoning effort: " + reasoning_effort_);
                             refresh_ui(true);
                         } else if (cmd_name == "/theme") {
-                            const char* order[] = {"dark","matrix","amber","mono"};
-                            int idx = 0; for (int k = 0; k < 4; k++) if (theme_ == order[k]) idx = k;
-                            set_theme(order[(idx + 1) % 4]);
+                            cycle_theme();
                             set_status(StatusType::PROCESSING, "theme: " + theme_);
                             refresh_ui(true);
                         } else if (cmd_name == "/save") {

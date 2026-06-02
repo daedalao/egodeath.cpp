@@ -63,6 +63,8 @@ public:
     int request_tool_approval(const std::string& prompt); // worker thread: 0 deny, 1 once, 2 always
     void set_theme(const std::string& name);
     std::string current_theme() const { return theme_; }
+    void cycle_theme();
+    bool has_theme(const std::string& name) const;
     void clear_history();
     void set_save_callback(std::function<void()> cb) { save_callback_ = std::move(cb); }
     void set_load_callback(std::function<void()> cb) { load_callback_ = std::move(cb); }
@@ -88,6 +90,7 @@ private:
     void _render_command_palette();
     void _render_help();
     void _apply_theme(const std::string& name);
+    void _load_themes();
     
     WINDOW *dash_win_ = nullptr;
     WINDOW *hist_win_ = nullptr;
@@ -151,6 +154,8 @@ private:
     std::function<std::string()> mcp_callback_;
     std::string reasoning_effort_ = "medium";
     std::string theme_ = "dark";
+    std::map<std::string, std::map<int, std::pair<int,int>>> themes_;
+    std::vector<std::string> theme_order_;
     std::atomic<bool> approval_pending_{false};
     std::mutex approval_mtx_;
     std::condition_variable approval_cv_;

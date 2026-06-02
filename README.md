@@ -114,13 +114,14 @@ Persistent preferences live in `~/.config/egodeath/config.json` (or
   "web_search": false,
   "shell": false,
   "auto_approve": false,
-  "searxng_url": "http://127.0.0.1:8888"
+  "searxng_url": "http://127.0.0.1:8888",
+  "compact_at": 0.85
 }
 ```
 
 **Precedence (later wins):** built-in defaults → `config.json` → environment variables →
 runtime `/commands`. So you can set `"web_search": true` or `"shell": true` here to have
-them on by default, while still toggling them per-session with `/web` / `/shell`.
+them on by default, while still toggling them per-session with `/web` / `/shell`. `compact_at` is the fraction of the context window (0.3–0.95) at which the conversation is auto-summarized.
 
 The same directory is also the global home for MCP servers: `~/.config/egodeath/mcp.json`
 is used when no project-level `.egodeath/mcp.json` is present.
@@ -192,6 +193,25 @@ shown when it happens.
 
 Four built-in color themes: `dark` (default), `matrix`, `amber`, and `mono`. Switch with
 `/theme` (palette cycles) or `/theme <name>` (inline). The change applies instantly.
+
+**Custom themes** can be defined in `~/.config/egodeath/themes.json`. Each theme overrides
+any of these color roles (others inherit from `dark`); each value is `[foreground,
+background]` in xterm-256 codes (`-1` = terminal default):
+
+```json
+{
+  "nord": {
+    "border": [110, -1],
+    "text":   [188, -1],
+    "user":   [236, 110],
+    "code":   [108, 236]
+  }
+}
+```
+
+Roles: `border`, `tool`, `accent`, `text`, `user`, `alt`, `error`, `highlight`,
+`selection`, `dim`, `code`. Custom themes join the `/theme` cycle alongside the built-ins,
+and can be set as the default via `"theme"` in `config.json`.
 
 ### Web search (SearXNG)
 
