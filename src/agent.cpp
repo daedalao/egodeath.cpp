@@ -387,6 +387,37 @@ std::string Agent::web_fetch(const std::string& url) {
     return text.empty() ? "(no readable text)" : text;
 }
 
+// Validate a tool call against the schema we actually advertised to the model.
+// Returns an empty string if valid, otherwise a precise error to hand back as the
+// tool result so the model self-corrects on the next turn (instead of a silent drop).
+static std::string validate_tool_call(const json& all_tools, const std::string& name, const json& args) {
+    const json* fn = nullptr;
+    for (const auto& t : all_tools)
+        if (t.contains("function") && t["function"].value("name", std::string()) == name) {
+            fn = &t["function"]; break;
+        }
+    if (!fn)
+        return "error: unknown tool '" + name + "'. Only call tools from the provided list.";
+    if (fn->contains("parameters") && (*fn)["parameters"].contains("required") &&
+        (*fn)["parameters"]["required"].is_array()) {
+        std::vector<std::string> missing;
+        for (const auto& r : (*fn)["parameters"]["required"]) {
+            if (!r.is_string()) continue;
+            std::string key = r.get<std::string>();
+            bool absent = !args.contains(key) || args[key].is_null() ||
+                          (args[key].is_string() && args[key].get<std::string>().empty());
+            if (absent) missing.push_back(key);
+        }
+        if (!missing.empty()) {
+            std::string m;
+            for (size_t i = 0; i < missing.size(); ++i) { if (i) m += ", "; m += "'" + missing[i] + "'"; }
+            return "error: missing required argument(s): " + m +
+                   ". Re-issue the call with every required field set.";
+        }
+    }
+    return "";
+}
+
 void Agent::checkpoint_file(const std::filesystem::path& p) {
     if (p.empty()) return;
     FileCheckpoint cp; cp.path = p;
@@ -667,9 +698,11 @@ void Agent::turn_async(int depth) {
                     continue;
                 }
 
-                // Per-tool approval gate for mutating tools.
+                std::string _verr = validate_tool_call(all_tools, name, args);
+
+                // Per-tool approval gate for mutating tools (skipped for invalid calls).
                 bool _denied = false;
-                if (((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || mcp_.owns(name)) && !auto_approve_.load()) {
+                if (_verr.empty() && ((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || mcp_.owns(name)) && !auto_approve_.load()) {
                     std::string _aarg;
                     for (const auto& [_k, _v] : args.items()) {
                         if (_k == "command" || _k == "filepath" || _k == "path") {
@@ -692,7 +725,9 @@ void Agent::turn_async(int depth) {
                 }
 
                 std::string res;
-                if (_denied) {
+                if (!_verr.empty()) {
+                    res = _verr;
+                } else if (_denied) {
                     res = "[tool call denied by user]";
                 } else if (name == "save_memory") {
                     memory_.save(args.value("name",""), args.value("description",""), args.value("fact",""), args.value("type","unknown"), args.value("scope","global"));
