@@ -415,6 +415,114 @@ void ProTUI::_render_command_palette() {
     wnoutrefresh(status_win_);
 }
 
+void ProTUI::open_agenda() {
+    input_mode_ = InputMode::AGENDA;
+    agenda_sel_ = 0;
+    _agenda_refetch();
+    refresh_ui(true);
+}
+
+void ProTUI::_agenda_refetch() {
+    if (agenda_provider_) {
+        try { agenda_items_ = agenda_provider_(); } catch (...) { agenda_items_ = json::array(); }
+    }
+    if (!agenda_items_.is_array()) agenda_items_ = json::array();
+}
+
+std::string ProTUI::_agenda_add_prompt() {
+    if (!in_win_) return "";
+    werase(in_win_);
+    wattron(in_win_, COLOR_PAIR(1));
+    box(in_win_, 0, 0);
+    wattroff(in_win_, COLOR_PAIR(1));
+    mvwaddstr(in_win_, 1, 2, "new task (Enter to add, empty to cancel): ");
+    wnoutrefresh(in_win_); doupdate();
+    curs_set(1); echo(); wtimeout(in_win_, -1);
+    char buf[256] = {0};
+    wgetnstr(in_win_, buf, sizeof(buf) - 1);
+    noecho(); curs_set(0); wtimeout(in_win_, 200);
+    std::string s = buf;
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+    return s;
+}
+
+void ProTUI::_render_agenda() {
+    if (!hist_win_) return;
+    werase(hist_win_);
+    int h = getmaxy(hist_win_), w = getmaxx(hist_win_);
+    auto vlen = [](const std::string& s) { int n = 0; for (unsigned char c : s) if ((c & 0xC0) != 0x80) n++; return n; };
+
+    // Partition into tasks then events; record the selectable id order.
+    std::vector<int> tasks, events;
+    for (int i = 0; i < (int)agenda_items_.size(); ++i)
+        (agenda_items_[i].value("kind", "task") == "event" ? events : tasks).push_back(i);
+    agenda_order_ids_.clear();
+    for (int i : tasks)  agenda_order_ids_.push_back(agenda_items_[i].value("id", (long long)0));
+    for (int i : events) agenda_order_ids_.push_back(agenda_items_[i].value("id", (long long)0));
+    if (agenda_sel_ >= (int)agenda_order_ids_.size()) agenda_sel_ = (int)agenda_order_ids_.size() - 1;
+    if (agenda_sel_ < 0) agenda_sel_ = 0;
+
+    int r = 0;
+    auto sep = [&](const std::string& t) {
+        if (r >= h) return;
+        wattron(hist_win_, COLOR_PAIR(1));
+        std::string s = "\u2500\u2500 " + t + " ";
+        s = std::string("\xe2\x94\x80\xe2\x94\x80 ") + t + " ";
+        while (vlen(s) < w - 1) s += "\xe2\x94\x80";
+        mvwaddstr(hist_win_, r++, 0, s.c_str());
+        wattroff(hist_win_, COLOR_PAIR(1));
+    };
+
+    wattron(hist_win_, A_BOLD | COLOR_PAIR(3));
+    mvwaddstr(hist_win_, r++, 0, "AGENDA");
+    wattroff(hist_win_, A_BOLD | COLOR_PAIR(3));
+
+    int sidx = 0;
+    auto draw_item = [&](int arrIdx) {
+        if (r >= h) return;
+        const auto& it = agenda_items_[arrIdx];
+        bool selected = (sidx == agenda_sel_);
+        std::string kind = it.value("kind", "task");
+        std::string status = it.value("status", "open");
+        std::string box = status == "done" ? "[x]" : status == "cancelled" ? "[-]" : "[ ]";
+        std::string pri = it.value("priority", "");
+        std::string pritag = pri == "high" ? " !hi" : pri == "med" ? " ~md" : pri == "low" ? " .lo" : "";
+        std::string when = kind == "event" ? it.value("start", "") : it.value("due", "");
+        long long id = it.value("id", (long long)0);
+        std::string left = std::string(selected ? "\xe2\x96\xb8" : " ") + " " + box +
+                           " #" + std::to_string(id) + " " + it.value("title", "") + pritag;
+        std::string full = left;
+        int pad = w - vlen(left) - (int)when.size() - 1;
+        if (pad > 0 && !when.empty()) full += std::string(pad, ' ') + when;
+        int color = status == "done" ? 10 : (pri == "high" ? 7 : 4);
+        if (selected) wattron(hist_win_, A_REVERSE | COLOR_PAIR(color));
+        else          wattron(hist_win_, COLOR_PAIR(color));
+        mvwaddstr(hist_win_, r, 0, full.c_str());
+        if (selected) wattroff(hist_win_, A_REVERSE | COLOR_PAIR(color));
+        else          wattroff(hist_win_, COLOR_PAIR(color));
+        r++; sidx++;
+    };
+    auto none = [&]() {
+        if (r >= h) return;
+        wattron(hist_win_, COLOR_PAIR(10));
+        mvwaddstr(hist_win_, r++, 2, "(none)");
+        wattroff(hist_win_, COLOR_PAIR(10));
+    };
+
+    sep("tasks (" + std::to_string(tasks.size()) + ")");
+    if (tasks.empty()) none(); else for (int i : tasks) draw_item(i);
+    sep("calendar (" + std::to_string(events.size()) + ")");
+    if (events.empty()) none(); else for (int i : events) draw_item(i);
+    wnoutrefresh(hist_win_);
+
+    werase(status_win_);
+    wattron(status_win_, COLOR_PAIR(9));
+    mvwaddstr(status_win_, 0, 1, "AGENDA  j/k move  space toggle done  a add  d delete  r refresh  q/Esc exit");
+    wattroff(status_win_, COLOR_PAIR(9));
+    wnoutrefresh(status_win_);
+}
+
 void ProTUI::_render_help() {
     if (!hist_win_) return;
     int h = getmaxy(hist_win_);
@@ -448,6 +556,7 @@ void ProTUI::_render_help() {
         {"  /effort low|medium|high",            "  /undo          undo last file write"},
         {"  /theme dark|matrix|amber|mono",      "  /exit          quit"},
         {"  ! <cmd>  run a shell command",       "  @path          attach/inject a file"},
+        {"  /agenda /tasks  task & calendar view", "  F2             toggle agenda view"},
     };
 
     int c2 = w / 2;
@@ -517,6 +626,7 @@ void ProTUI::_render_history() {
     int h = getmaxy(hist_win_);
 
     if (input_mode_ == InputMode::HELP) { _render_help(); return; }
+    if (input_mode_ == InputMode::AGENDA) { _render_agenda(); return; }
 
     // If in command palette mode, render command palette instead of history
     if (input_mode_ == InputMode::COMMAND_PALETTE) {
@@ -1013,6 +1123,32 @@ std::string ProTUI::get_input() {
         }
         if (input_mode_ == InputMode::HELP) {
             input_mode_ = InputMode::NORMAL; refresh_ui(true); continue;
+        }
+
+        if (ch == KEY_F(2)) {
+            if (input_mode_ == InputMode::AGENDA) { input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true); }
+            else open_agenda();
+            continue;
+        }
+        if (input_mode_ == InputMode::AGENDA) {
+            int n = (int)agenda_order_ids_.size();
+            long long sel_id = (agenda_sel_ >= 0 && agenda_sel_ < n) ? agenda_order_ids_[agenda_sel_] : 0;
+            if (ch == 'q' || ch == 27) { input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true); }
+            else if (ch == 'j' || ch == KEY_DOWN) { if (agenda_sel_ < n - 1) agenda_sel_++; refresh_ui(true); }
+            else if (ch == 'k' || ch == KEY_UP)   { if (agenda_sel_ > 0) agenda_sel_--; refresh_ui(true); }
+            else if (ch == 'r') { _agenda_refetch(); refresh_ui(true); }
+            else if ((ch == ' ' || ch == '\n' || ch == 13) && sel_id && agenda_action_) {
+                agenda_action_("toggle", sel_id, ""); _agenda_refetch(); refresh_ui(true);
+            }
+            else if (ch == 'd' && sel_id && agenda_action_) {
+                agenda_action_("delete", sel_id, ""); _agenda_refetch(); refresh_ui(true);
+            }
+            else if (ch == 'a') {
+                std::string title = _agenda_add_prompt();
+                if (!title.empty() && agenda_action_) agenda_action_("add", 0, title);
+                _agenda_refetch(); refresh_ui(true);
+            }
+            continue;
         }
 
         // ESC: Alt+Enter newline only

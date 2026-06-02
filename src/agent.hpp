@@ -30,6 +30,8 @@ public:
     void set_searxng_url(const std::string& u) { searxng_url_ = u; }
     std::string undo_last_edit();
     std::string mcp_status() const { return mcp_.status(); }
+    json agenda_snapshot();
+    std::string agenda_action(const std::string& op, long long id, const std::string& arg);
     void cancel();
     ~Agent();
     

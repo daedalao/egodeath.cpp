@@ -22,6 +22,7 @@ enum class InputMode {
     SEARCH,              // fuzzy search mode (Ctrl+F)
     COMMAND_PALETTE,     // command palette mode (Ctrl+P)
     HELP,                // help overlay (F1)
+    AGENDA,              // task/calendar view (F2)
 };
 
 class ProTUI {
@@ -69,6 +70,10 @@ public:
     void set_save_callback(std::function<void()> cb) { save_callback_ = std::move(cb); }
     void set_load_callback(std::function<void()> cb) { load_callback_ = std::move(cb); }
     void set_mcp_callback(std::function<std::string()> cb) { mcp_callback_ = std::move(cb); }
+    void set_agenda_provider(std::function<json()> cb) { agenda_provider_ = std::move(cb); }
+    void set_agenda_action(std::function<std::string(const std::string&, long long, const std::string&)> cb) { agenda_action_ = std::move(cb); }
+    void open_agenda();
+    bool agenda_open() const { return input_mode_ == InputMode::AGENDA; }
 
     bool is_running() const { return running_; }
     bool is_history_empty() const;  // Check if history is empty (thread-safe)
@@ -89,6 +94,9 @@ private:
     void _update_command_palette_results();
     void _render_command_palette();
     void _render_help();
+    void _render_agenda();
+    void _agenda_refetch();
+    std::string _agenda_add_prompt();
     void _apply_theme(const std::string& name);
     void _load_themes();
     
@@ -152,6 +160,11 @@ private:
     std::function<void()> save_callback_;
     std::function<void()> load_callback_;
     std::function<std::string()> mcp_callback_;
+    std::function<json()> agenda_provider_;
+    std::function<std::string(const std::string&, long long, const std::string&)> agenda_action_;
+    json agenda_items_ = json::array();
+    std::vector<long long> agenda_order_ids_;
+    int agenda_sel_ = 0;
     std::string reasoning_effort_ = "medium";
     std::string theme_ = "dark";
     std::map<std::string, std::map<int, std::pair<int,int>>> themes_;

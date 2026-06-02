@@ -435,6 +435,29 @@ static std::string validate_tool_call(const json& all_tools, const std::string& 
     return "";
 }
 
+json Agent::agenda_snapshot() {
+    json arr = json::array();
+    if (!store_) return arr;
+    for (auto& it : store_->list("all", "all", "", "", 200)) arr.push_back(it.to_json());
+    return arr;
+}
+
+std::string Agent::agenda_action(const std::string& op, long long id, const std::string& arg) {
+    if (!store_) return "store unavailable";
+    std::string e;
+    if (op == "toggle") {
+        auto it = store_->get(id);
+        if (!it) return "no item #" + std::to_string(id);
+        return store_->set_status(id, it->status == "done" ? "open" : "done", e) ? "" : e;
+    }
+    if (op == "delete") return store_->remove(id, e) ? "" : e;
+    if (op == "add") {
+        Item t; t.kind = "task"; t.title = arg;
+        return store_->add(t, e) > 0 ? "" : e;
+    }
+    return "unknown op";
+}
+
 void Agent::checkpoint_file(const std::filesystem::path& p) {
     if (p.empty()) return;
     FileCheckpoint cp; cp.path = p;

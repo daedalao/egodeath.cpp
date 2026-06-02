@@ -109,6 +109,10 @@ int main() {
         if (std::filesystem::exists(p) && !agent.is_busy()) agent.load_session(p);
     });
     tui.set_mcp_callback([&]() { return agent.mcp_status(); });
+    tui.set_agenda_provider([&]() { return agent.agenda_snapshot(); });
+    tui.set_agenda_action([&](const std::string& op, long long id, const std::string& arg) {
+        return agent.agenda_action(op, id, arg);
+    });
 
     agent.on_metrics = [&](const json& m) {
         Metrics metrics;
@@ -171,6 +175,12 @@ int main() {
         // Inline slash command: /mcp (list MCP servers and tools)
         if (input == "/mcp") {
             tui.append_history("", agent.mcp_status(), "system");
+            continue;
+        }
+
+        // Inline slash command: /agenda or /tasks (open the task/calendar view)
+        if (input == "/agenda" || input == "/tasks" || input == "/cal" || input == "/calendar") {
+            tui.open_agenda();
             continue;
         }
 
