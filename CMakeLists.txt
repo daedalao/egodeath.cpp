@@ -15,8 +15,9 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(NCURSES REQUIRED ncursesw)
 pkg_check_modules(FMT REQUIRED fmt)
+pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 
-include_directories(src ${NCURSES_INCLUDE_DIRS} ${FMT_INCLUDE_DIRS})
+include_directories(src ${NCURSES_INCLUDE_DIRS} ${FMT_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS})
 
 add_executable(egodeath
     src/main.cpp
@@ -28,6 +29,7 @@ add_executable(egodeath
     src/memory.cpp
     src/sys_monitor.cpp
     src/mcp.cpp
+    src/store.cpp
 )
 
 target_link_libraries(egodeath 
@@ -36,6 +38,7 @@ target_link_libraries(egodeath
     CURL::libcurl 
     ${NCURSES_LIBRARIES}
     ${FMT_LIBRARIES}
+    ${SQLITE3_LIBRARIES}
     dl
 )
 

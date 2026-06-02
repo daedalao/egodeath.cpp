@@ -5,10 +5,12 @@
 #include "tui.hpp"
 #include "memory.hpp"
 #include "mcp.hpp"
+#include "store.hpp"
 
 #include <queue>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 
 namespace egodeath {
 
@@ -90,6 +92,7 @@ private:
 
     Memory memory_;
     McpManager mcp_;
+    std::unique_ptr<Store> store_;
 };
 
 } // namespace egodeath

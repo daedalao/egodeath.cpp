@@ -42,6 +42,15 @@ Agent::Agent(LlamaClient::Config cfg, ProTUI& tui, std::filesystem::path project
     std::string sys_prompt = base_prompt + memory_.system_prompt_addendum();
     history.push_back({{"role", "system"}, {"content", sys_prompt}});
 
+    // Open the SQLite task/calendar store under the XDG config dir.
+    {
+        namespace fs = std::filesystem;
+        fs::path cdir = std::getenv("XDG_CONFIG_HOME")
+            ? fs::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
+            : fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".config" / "egodeath";
+        store_ = std::make_unique<Store>(cdir / "egodeath.db");
+    }
+
     // Connect any configured MCP servers (EGODEATH_MCP_CONFIG, else .egodeath/mcp.json).
     {
         namespace fs = std::filesystem;
@@ -390,6 +399,14 @@ std::string Agent::web_fetch(const std::string& url) {
 // Validate a tool call against the schema we actually advertised to the model.
 // Returns an empty string if valid, otherwise a precise error to hand back as the
 // tool result so the model self-corrects on the next turn (instead of a silent drop).
+static long long json_id(const json& a) {
+    if (!a.contains("id")) return 0;
+    const auto& v = a["id"];
+    if (v.is_number_integer()) return v.get<long long>();
+    if (v.is_string()) { try { return std::stoll(v.get<std::string>()); } catch (...) {} }
+    return 0;
+}
+
 static std::string validate_tool_call(const json& all_tools, const std::string& name, const json& args) {
     const json* fn = nullptr;
     for (const auto& t : all_tools)
@@ -544,6 +561,11 @@ void Agent::turn_async(int depth) {
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"save_memory","description":"Persist a fact to long-term memory across sessions.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Short unique slug"},"description":{"type":"string","description":"One-line summary of what this memory contains"},"fact":{"type":"string","description":"The content to store"},"type":{"type":"string","description":"Category: user, project, feedback, or reference"},"scope":{"type":"string","description":"global or project, defaults to global"}},"required":["name","description","fact"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"recall_memory","description":"Retrieve memories. Use an empty query string to get ALL memories. Pass keywords to filter by name or description.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Keyword filter. Empty string returns all memories."},"scope":{"type":"string","description":"all, global, or project. defaults to all"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_memory","description":"Delete a memory entry by its name slug.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The name slug of the memory to delete"}},"required":["name"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_task","description":"Add a task to the SQLite task/calendar store. Tasks appear in the agenda view.","parameters":{"type":"object","properties":{"title":{"type":"string"},"notes":{"type":"string"},"priority":{"type":"string","description":"low, med, or high"},"due":{"type":"string","description":"Due date YYYY-MM-DD (optional)"}},"required":["title"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_event","description":"Add a calendar event with a start time (and optional end) to the store.","parameters":{"type":"object","properties":{"title":{"type":"string"},"start":{"type":"string","description":"Start as YYYY-MM-DD or YYYY-MM-DDTHH:MM"},"end":{"type":"string","description":"End (optional)"},"notes":{"type":"string"}},"required":["title","start"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_items","description":"List tasks and/or events from the store. Defaults to open items.","parameters":{"type":"object","properties":{"kind":{"type":"string","description":"task, event, or all (default all)"},"status":{"type":"string","description":"open, done, cancelled, or all (default open)"},"from":{"type":"string","description":"Earliest date YYYY-MM-DD (optional)"},"to":{"type":"string","description":"Latest date YYYY-MM-DD (optional)"}}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"complete_item","description":"Mark a task or event done by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_item","description":"Delete a task or event by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
     if (web_enabled_.load()) {
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_search","description":"Search the web via a local SearXNG instance. Returns ranked results with titles, URLs, and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"How many results to return (default 5, max 15)"}},"required":["query"]}}})SCHEMA"));
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its readable text content (HTML stripped). Use after web_search to read a result page.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"Absolute http(s) URL to fetch"}},"required":["url"]}}})SCHEMA"));
@@ -746,6 +768,32 @@ void Agent::turn_async(int depth) {
                     res = web_search(args.value("query", ""), args.value("max_results", 5));
                 } else if (name == "web_fetch") {
                     res = web_fetch(args.value("url", ""));
+                } else if (name == "add_task") {
+                    Item it; it.kind = "task"; it.title = args.value("title", "");
+                    it.notes = args.value("notes", ""); it.priority = args.value("priority", "");
+                    it.due = args.value("due", "");
+                    std::string e; long long id = store_ ? store_->add(it, e) : -1;
+                    res = id > 0 ? fmt::format("task #{} added: {}", id, it.title) : "error: " + e;
+                } else if (name == "add_event") {
+                    Item it; it.kind = "event"; it.title = args.value("title", "");
+                    it.notes = args.value("notes", ""); it.start_ts = args.value("start", "");
+                    it.end_ts = args.value("end", "");
+                    std::string e; long long id = store_ ? store_->add(it, e) : -1;
+                    res = id > 0 ? fmt::format("event #{} added: {}", id, it.title) : "error: " + e;
+                } else if (name == "list_items") {
+                    if (!store_) { res = "error: store unavailable"; }
+                    else {
+                        auto items = store_->list(args.value("kind", "all"), args.value("status", "open"),
+                                                  args.value("from", ""), args.value("to", ""), 100);
+                        if (items.empty()) res = "(no items)";
+                        else for (auto& it : items) res += it.one_line() + "\n";
+                    }
+                } else if (name == "complete_item") {
+                    std::string e; bool ok = store_ && store_->set_status(json_id(args), "done", e);
+                    res = ok ? "marked done" : "error: " + e;
+                } else if (name == "remove_item") {
+                    std::string e; bool ok = store_ && store_->remove(json_id(args), e);
+                    res = ok ? "removed" : "error: " + e;
                 } else if (name == "write_file") {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);
