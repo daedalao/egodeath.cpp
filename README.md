@@ -115,13 +115,14 @@ Persistent preferences live in `~/.config/egodeath/config.json` (or
   "shell": false,
   "auto_approve": false,
   "searxng_url": "http://127.0.0.1:8888",
-  "compact_at": 0.85
+  "compact_at": 0.85,
+  "cache_prompt": true
 }
 ```
 
 **Precedence (later wins):** built-in defaults → `config.json` → environment variables →
 runtime `/commands`. So you can set `"web_search": true` or `"shell": true` here to have
-them on by default, while still toggling them per-session with `/web` / `/shell`. `compact_at` is the fraction of the context window (0.3–0.95) at which the conversation is auto-summarized.
+them on by default, while still toggling them per-session with `/web` / `/shell`. `compact_at` is the fraction of the context window (0.3–0.95) at which the conversation is auto-summarized. `cache_prompt` (default true) reuses the llama.cpp server KV cache across turns, so each turn only prefills the new tokens — the context gauge shows a ⚡ cached count when this kicks in.
 
 The same directory is also the global home for MCP servers: `~/.config/egodeath/mcp.json`
 is used when no project-level `.egodeath/mcp.json` is present.

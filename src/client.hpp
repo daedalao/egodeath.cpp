@@ -12,6 +12,7 @@ public:
         int timeout_seconds = 1800;
         bool verbose = false;
         std::string reasoning_effort = "medium"; // low | medium | high (sent when non-empty)
+        bool cache_prompt = true; // reuse the server KV cache across turns (llama.cpp)
     };
 
     explicit LlamaClient(Config config);

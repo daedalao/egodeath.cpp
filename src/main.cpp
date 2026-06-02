@@ -35,6 +35,7 @@ int main() {
     config.endpoint = pref_str("endpoint", config.endpoint);
     config.model = pref_str("model", config.model);
     config.reasoning_effort = pref_str("reasoning_effort", config.reasoning_effort);
+    config.cache_prompt = pref_bool("cache_prompt", true);
     if (auto e = std::getenv("LLAMA_ENDPOINT")) config.endpoint = e;
     if (auto m = std::getenv("LLAMA_MODEL")) config.model = m;
     if (auto re = std::getenv("LLAMA_REASONING_EFFORT")) config.reasoning_effort = re;
@@ -131,12 +132,22 @@ int main() {
         else if (m.contains("eval_time") && m.value("eval_time", 0.0) > 0)
             metrics.gen_speed = m.value("eval_tokens", 0) / (m.value("eval_time", 1.0) / 1000.0);
 
-        // Exact value from STREAM_END timings (highest priority)
-        if (m.contains("prompt_n")) {
+        // Exact value from STREAM_END timings (highest priority).
+        // usage.total_tokens reflects the FULL context (cached + new); prompt_n is
+        // only the newly-processed prefix, so prefer usage to keep the gauge honest.
+        if (m.contains("usage_total_tokens")) {
+            metrics.ctx_used = m.value("usage_total_tokens", 0);
+            int processed = m.value("prompt_n", 0);
+            int gen_tok = m.value("usage_completion_tokens", m.value("predicted_n", 0));
+            int cached = m.value("cache_n", m.value("usage_cached_tokens", 0));
+            std::string cache_hint = cached > 0 ? fmt::format("  \u26a1{} cached", cached) : std::string();
+            tui.set_status(StatusType::IDLE,
+                fmt::format("{}pp + {}gen tokens{}", processed, gen_tok, cache_hint));
+        }
+        else if (m.contains("prompt_n")) {
             int pp_tok = m.value("prompt_n", 0);
             int gen_tok = m.value("predicted_n", 0);
             metrics.ctx_used = pp_tok + gen_tok;
-            // Show per-turn token breakdown in the status bar
             tui.set_status(StatusType::IDLE,
                 fmt::format("{}pp + {}gen tokens", pp_tok, gen_tok));
         }

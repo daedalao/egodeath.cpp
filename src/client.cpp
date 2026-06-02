@@ -68,6 +68,20 @@ size_t LlamaClient::StreamCallback(void* contents, size_t size, size_t nmemb, vo
                     UIEvent ev;
                     ev.type = UIEvent::Type::STREAM_END;
                     ev.timings = j["timings"];
+                    // Merge OpenAI usage (total prompt incl. cached) so the context
+                    // gauge stays correct when the KV cache skips prefix tokens.
+                    if (j.contains("usage") && j["usage"].is_object()) {
+                        const auto& u = j["usage"];
+                        if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number())
+                            ev.timings["usage_prompt_tokens"] = u["prompt_tokens"];
+                        if (u.contains("completion_tokens") && u["completion_tokens"].is_number())
+                            ev.timings["usage_completion_tokens"] = u["completion_tokens"];
+                        if (u.contains("total_tokens") && u["total_tokens"].is_number())
+                            ev.timings["usage_total_tokens"] = u["total_tokens"];
+                        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object() &&
+                            u["prompt_tokens_details"].contains("cached_tokens"))
+                            ev.timings["usage_cached_tokens"] = u["prompt_tokens_details"]["cached_tokens"];
+                    }
                     ctx->cb(ev);
                 }
                 
@@ -103,7 +117,7 @@ json LlamaClient::chat(const json& messages, const std::optional<json>& tools) {
     if (!curl) return {};
     
     std::string response;
-    json body = {{"model", config_.model}, {"messages", messages}, {"stream", false}};
+    json body = {{"model", config_.model}, {"messages", messages}, {"stream", false}, {"cache_prompt", config_.cache_prompt}};
     if (!config_.reasoning_effort.empty()) body["reasoning_effort"] = config_.reasoning_effort;
     if (tools) body["tools"] = *tools;
 
@@ -130,7 +144,7 @@ void LlamaClient::chat_stream(const json& messages, const std::optional<json>& t
     std::unique_ptr<CURL, void(*)(CURL*)> curl(create_curl_handle(), cleanup_curl_handle);
     if (!curl) return;
     
-    json body = {{"model", config_.model}, {"messages", messages}, {"stream", true}};
+    json body = {{"model", config_.model}, {"messages", messages}, {"stream", true}, {"cache_prompt", config_.cache_prompt}, {"stream_options", {{"include_usage", true}}}};
     if (!config_.reasoning_effort.empty()) body["reasoning_effort"] = config_.reasoning_effort;
     if (tools) body["tools"] = *tools;
 
