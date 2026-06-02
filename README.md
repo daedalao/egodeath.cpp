@@ -21,7 +21,7 @@ streaming, agentic tool use, persistent memory, and hardware monitoring.
 ### Tool use
 - `read_file` — read a file (capped at 512 KB, rejects paths outside working directory)
 - `write_file` — write a file (same path restriction)
-- `exec_shell` — run a shell command and return output
+- `exec_shell` — run a shell command and return output (**disabled by default**; enable with `/shell on`)
 - `grep_search` — regex search across files (skips binaries)
 - `list_directory` — list a directory
 - `glob_search` — find files matching a glob pattern
@@ -95,8 +95,35 @@ LLAMA_MODEL=qwen2.5-coder-32b \
 | `LLAMA_MODEL` | `local-model` | Model name sent in requests |
 | `LLAMA_REASONING_EFFORT` | `medium` | Reasoning effort (`low`/`medium`/`high`) sent with each request |
 | `EGODEATH_AUTO_APPROVE` | _(unset)_ | Set to `1` to auto-approve all tool calls (skip confirmation prompts) |
+| `EGODEATH_SHELL` | _(unset)_ | Set to `1` to enable the model's `exec_shell` tool at startup |
 | `EGODEATH_SEARXNG_URL` | `http://127.0.0.1:8888` | Base URL of the SearXNG instance for web search |
 | `EGODEATH_WEB_SEARCH` | _(unset)_ | Set to `1` to enable the web search tool at startup |
+| `EGODEATH_MCP_CONFIG` | `.egodeath/mcp.json` | Path to the MCP server config |
+
+### Configuration file
+
+Persistent preferences live in `~/.config/egodeath/config.json` (or
+`$XDG_CONFIG_HOME/egodeath/config.json`). All keys are optional:
+
+```json
+{
+  "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+  "model": "local-model",
+  "reasoning_effort": "medium",
+  "theme": "dark",
+  "web_search": false,
+  "shell": false,
+  "auto_approve": false,
+  "searxng_url": "http://127.0.0.1:8888"
+}
+```
+
+**Precedence (later wins):** built-in defaults → `config.json` → environment variables →
+runtime `/commands`. So you can set `"web_search": true` or `"shell": true` here to have
+them on by default, while still toggling them per-session with `/web` / `/shell`.
+
+The same directory is also the global home for MCP servers: `~/.config/egodeath/mcp.json`
+is used when no project-level `.egodeath/mcp.json` is present.
 
 ### System prompt (`egodeath.md`)
 
@@ -127,8 +154,10 @@ Typed directly in the input box (no palette needed):
 | `/effort [low\|medium\|high]` | Set reasoning effort (no argument cycles) |
 | `/theme [dark\|matrix\|amber\|mono]` | Switch color theme (no argument cycles) |
 | `/auto [on\|off]` | Toggle tool-call auto-approval |
+| `/shell [on\|off]` | Enable/disable the model's `exec_shell` tool (off by default) |
 | `/web [on\|off]` | Toggle the SearXNG web search tool (no argument shows status) |
 | `/undo` | Restore the file changed by the most recent `write_file` tool call |
+| `/mcp` | List connected MCP servers and their tools |
 | `/save [name]` | Save the session (default slot `last`, or a named slot) |
 | `/load [name]` | Load a saved session and repaint the transcript |
 | `Tab` | Autocomplete a slash command and its arguments |
@@ -206,6 +235,35 @@ inspect the result, `/undo` if you don't like it.
 The dashboard draws a live Unicode sparkline (`▁▂▃▄▅▆▇█`) of recent generation
 tokens/sec next to the `pp / gen` figures, so you can see throughput trends at a glance
 (rendered when the terminal is wide enough).
+
+### MCP servers
+
+egodeath can load external [MCP](https://modelcontextprotocol.io) servers and expose
+their tools to the model, so capabilities can be added by config instead of recompiling.
+
+Define servers in `.egodeath/mcp.json` (or point `EGODEATH_MCP_CONFIG` elsewhere), using
+the standard `mcpServers` schema — configs from Claude Desktop / other MCP clients work
+unchanged:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+    }
+  }
+}
+```
+
+At startup egodeath spawns each server (stdio transport), runs the MCP handshake, and
+discovers its tools. They appear to the model namespaced as `mcp__<server>__<tool>`. Run
+`/mcp` to list connected servers and their tools. MCP tools are treated as untrusted, so
+they go through the same approval prompt as `exec_shell`/`write_file` (bypass with `/auto`).
+
+Requires a runtime for the server commands (e.g. `node`/`npx` or `python`). Server stderr
+is discarded so it can't corrupt the TUI. Current support is stdio transport + tools
+(resources/prompts and HTTP transport are not yet implemented).
 
 ### Sessions (save / resume)
 
@@ -316,7 +374,11 @@ Press **F1** at any time to open the in-app help overlay with a full keybinding 
 
 - **Input field is capped at 3 visible lines.** Long inputs scroll within the box but the
   box itself does not grow beyond 3 lines. Dynamic expansion is a planned improvement.
-- **`exec_shell` is unrestricted.** It runs as the current user with no sandboxing. Run
+- **`exec_shell` is off by default and unrestricted when on.** The model cannot run shell
+  commands unless you enable the tool (`/shell on` or `EGODEATH_SHELL=1`); when enabled it
+  runs as the current user with no sandboxing, and each call still requires approval unless
+  `/auto` is on. Your own `!<command>` passthrough is always available and independent of
+  this setting. Run
   egodeath inside a container or VM if you need isolation.
 ---
 

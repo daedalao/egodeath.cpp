@@ -27,6 +27,7 @@ add_executable(egodeath
     src/tui.cpp
     src/memory.cpp
     src/sys_monitor.cpp
+    src/mcp.cpp
 )
 
 target_link_libraries(egodeath 

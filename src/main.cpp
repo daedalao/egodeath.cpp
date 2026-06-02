@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include <sstream>
+#include <fstream>
 #include <algorithm>
 #include <vector>
 
@@ -12,6 +13,28 @@ using namespace egodeath;
 
 int main() {
     LlamaClient::Config config;
+
+    // User preferences: $XDG_CONFIG_HOME/egodeath/config.json (or ~/.config/egodeath).
+    // Precedence: built-in defaults < config.json < environment variables < runtime /commands.
+    std::filesystem::path config_dir = std::getenv("XDG_CONFIG_HOME")
+        ? std::filesystem::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
+        : std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : ".") / ".config" / "egodeath";
+    json prefs = json::object();
+    {
+        std::ifstream pf(config_dir / "config.json");
+        if (pf) {
+            try { std::stringstream ss; ss << pf.rdbuf(); prefs = json::parse(ss.str()); }
+            catch (...) { prefs = json::object(); }
+        }
+    }
+    auto pref_bool = [&](const char* k, bool d) {
+        return (prefs.contains(k) && prefs[k].is_boolean()) ? prefs[k].get<bool>() : d; };
+    auto pref_str = [&](const char* k, std::string d) {
+        return (prefs.contains(k) && prefs[k].is_string()) ? prefs[k].get<std::string>() : d; };
+
+    config.endpoint = pref_str("endpoint", config.endpoint);
+    config.model = pref_str("model", config.model);
+    config.reasoning_effort = pref_str("reasoning_effort", config.reasoning_effort);
     if (auto e = std::getenv("LLAMA_ENDPOINT")) config.endpoint = e;
     if (auto m = std::getenv("LLAMA_MODEL")) config.model = m;
     if (auto re = std::getenv("LLAMA_REASONING_EFFORT")) config.reasoning_effort = re;
@@ -46,20 +69,21 @@ int main() {
     // Fetch context window size from server once at startup
     int ctx_size = agent.get_context_size();
     agent.set_ctx_size(ctx_size);
-    if (auto aa = std::getenv("EGODEATH_AUTO_APPROVE")) {
-        std::string v = aa; agent.set_auto_approve(!v.empty() && v != "0");
-    }
-    agent.set_searxng_url(std::getenv("EGODEATH_SEARXNG_URL")
-                          ? std::getenv("EGODEATH_SEARXNG_URL")
-                          : "http://127.0.0.1:8888");
-    if (auto ws = std::getenv("EGODEATH_WEB_SEARCH")) {
-        std::string v = ws; agent.set_web_enabled(!v.empty() && v != "0");
-    }
+    // Feature toggles: config.json is the base, env vars override.
+    agent.set_searxng_url(pref_str("searxng_url", "http://127.0.0.1:8888"));
+    agent.set_web_enabled(pref_bool("web_search", false));
+    agent.set_shell_enabled(pref_bool("shell", false));
+    agent.set_auto_approve(pref_bool("auto_approve", false));
+    if (auto su = std::getenv("EGODEATH_SEARXNG_URL")) agent.set_searxng_url(su);
+    if (auto ws = std::getenv("EGODEATH_WEB_SEARCH")) { std::string v = ws; agent.set_web_enabled(!v.empty() && v != "0"); }
+    if (auto sh = std::getenv("EGODEATH_SHELL")) { std::string v = sh; agent.set_shell_enabled(!v.empty() && v != "0"); }
+    if (auto aa = std::getenv("EGODEATH_AUTO_APPROVE")) { std::string v = aa; agent.set_auto_approve(!v.empty() && v != "0"); }
 
     // Wire Esc → cancel current generation
     tui.set_cancel_callback([&agent]() { agent.cancel(); });
     tui.set_effort_callback([&agent](const std::string& e) { agent.set_reasoning_effort(e); });
     tui.set_initial_effort(config.reasoning_effort);
+    tui.set_theme(pref_str("theme", "dark"));
 
     auto session_path = [](const std::string& name) -> std::string {
         namespace fs = std::filesystem;
@@ -77,6 +101,7 @@ int main() {
         std::string p = session_path("last");
         if (std::filesystem::exists(p) && !agent.is_busy()) agent.load_session(p);
     });
+    tui.set_mcp_callback([&]() { return agent.mcp_status(); });
 
     agent.on_metrics = [&](const json& m) {
         Metrics metrics;
@@ -125,6 +150,12 @@ int main() {
         std::string input = tui.get_input();
         if (input == "/exit" || input == "/quit") break;
         if (input.empty()) continue;
+
+        // Inline slash command: /mcp (list MCP servers and tools)
+        if (input == "/mcp") {
+            tui.append_history("", agent.mcp_status(), "system");
+            continue;
+        }
 
         // Inline slash command: /undo (restore the last file written by a tool)
         if (input == "/undo") {
@@ -228,6 +259,23 @@ int main() {
             if (!on && !off) { tui.append_history("", "usage: /auto [on|off]", "system"); continue; }
             agent.set_auto_approve(on);
             tui.append_history("", std::string("auto-approve: ") + (on ? "on" : "off"), "system");
+            continue;
+        }
+
+        // Inline slash command: /shell on|off (the model's exec_shell tool; off by default)
+        if (input.rfind("/shell", 0) == 0) {
+            std::string arg = input.size() > 6 ? input.substr(6) : std::string();
+            while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
+            while (!arg.empty() && arg.back() == ' ') arg.pop_back();
+            bool on = (arg == "on" || arg == "1" || arg == "yes");
+            bool off = (arg == "off" || arg == "0" || arg == "no");
+            if (!on && !off) {
+                tui.append_history("", std::string("shell access: ") + (agent.shell_enabled() ? "on" : "off")
+                                       + "  (usage: /shell on|off)", "system");
+                continue;
+            }
+            agent.set_shell_enabled(on);
+            tui.append_history("", std::string("shell access: ") + (on ? "on" : "off"), "system");
             continue;
         }
 

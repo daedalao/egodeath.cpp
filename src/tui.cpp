@@ -22,6 +22,7 @@ static const std::vector<Command> available_commands = {
     {"/toggle-reasoning", "Toggle reasoning display"},
     {"/effort", "Cycle reasoning effort: low/medium/high"},
     {"/theme", "Cycle color theme"},
+    {"/mcp", "List MCP servers and tools"},
     {"/exit", "Exit the application"},
 };
 
@@ -404,7 +405,14 @@ void ProTUI::_render_help() {
         {"  Paste      multi-line paste",   "OTHER"},
         {"  Ctrl+U     cancel staged paste","  Ctrl+G      toggle mouse"},
         {"",""},
-        {"COMMAND PALETTE  (/save  /load  /reset  /clear  /toggle-reasoning  /effort  /theme  /exit)",""},
+        {"COMMANDS  (type in input, or Ctrl+P for palette)",""},
+        {"  /save /load   session save/resume",  "  /web on|off    web search tool"},
+        {"  /reset        clear conversation",   "  /shell on|off  shell tool"},
+        {"  /clear        reset scroll",         "  /auto on|off   auto-approve tools"},
+        {"  /toggle-reasoning  reasoning",       "  /mcp           list MCP servers"},
+        {"  /effort low|medium|high",            "  /undo          undo last file write"},
+        {"  /theme dark|matrix|amber|mono",      "  /exit          quit"},
+        {"  ! <cmd>  run a shell command",       "  @path          attach/inject a file"},
     };
 
     int c2 = w / 2;
@@ -1099,6 +1107,10 @@ std::string ProTUI::get_input() {
                             if (load_callback_) load_callback_();
                             set_status(StatusType::PROCESSING, "session loaded");
                             refresh_ui(true);
+                        } else if (cmd_name == "/mcp") {
+                            if (mcp_callback_) append_history("", mcp_callback_(), "system");
+                            set_status(StatusType::PROCESSING, "mcp status");
+                            refresh_ui(true);
                         } else if (cmd_name == "/exit") {
                             shutdown();
                             return "";  // Exit early
@@ -1231,7 +1243,7 @@ std::string ProTUI::get_input() {
                 if (sp == std::string::npos) {
                     static const std::vector<std::string> cmds = {
                         "/save", "/load", "/reset", "/clear", "/toggle-reasoning",
-                        "/effort", "/theme", "/web", "/auto", "/undo", "/exit"
+                        "/effort", "/theme", "/web", "/auto", "/shell", "/undo", "/mcp", "/exit"
                     };
                     std::vector<std::string> matches;
                     for (const auto& cm : cmds) if (cm.rfind(buf, 0) == 0) matches.push_back(cm);
@@ -1256,7 +1268,7 @@ std::string ProTUI::get_input() {
                     std::vector<std::string> opts;
                     if (cmd == "/theme") opts = {"dark", "matrix", "amber", "mono"};
                     else if (cmd == "/effort") opts = {"low", "medium", "high"};
-                    else if (cmd == "/web" || cmd == "/auto") opts = {"on", "off"};
+                    else if (cmd == "/web" || cmd == "/auto" || cmd == "/shell") opts = {"on", "off"};
                     if (!opts.empty()) {
                         std::vector<std::string> matches;
                         for (const auto& o : opts) if (o.rfind(arg, 0) == 0) matches.push_back(o);

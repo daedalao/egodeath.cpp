@@ -66,6 +66,7 @@ public:
     void clear_history();
     void set_save_callback(std::function<void()> cb) { save_callback_ = std::move(cb); }
     void set_load_callback(std::function<void()> cb) { load_callback_ = std::move(cb); }
+    void set_mcp_callback(std::function<std::string()> cb) { mcp_callback_ = std::move(cb); }
 
     bool is_running() const { return running_; }
     bool is_history_empty() const;  // Check if history is empty (thread-safe)
@@ -147,6 +148,7 @@ private:
     std::function<void(const std::string&)> effort_callback_;
     std::function<void()> save_callback_;
     std::function<void()> load_callback_;
+    std::function<std::string()> mcp_callback_;
     std::string reasoning_effort_ = "medium";
     std::string theme_ = "dark";
     std::atomic<bool> approval_pending_{false};
