@@ -251,12 +251,6 @@ Every `write_file` tool call snapshots the file's prior contents first (up to 50
 file if it didn't exist before. Pairs well with the tool-approval prompt: approve a write,
 inspect the result, `/undo` if you don't like it.
 
-### Throughput sparkline
-
-The dashboard draws a live Unicode sparkline (`▁▂▃▄▅▆▇█`) of recent generation
-tokens/sec next to the `pp / gen` figures, so you can see throughput trends at a glance
-(rendered when the terminal is wide enough).
-
 ### MCP servers
 
 egodeath can load external [MCP](https://modelcontextprotocol.io) servers and expose
