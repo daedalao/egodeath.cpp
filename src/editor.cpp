@@ -8,8 +8,6 @@
 
 namespace egodeath {
 
-// Color pairs (defined by the TUI theme): 2=string/green, 3=keyword/yellow,
-// 4=text, 8=preproc/orange, 9=number/blue, 10=dim/comment/linenum.
 enum { C_TEXT = 4, C_KW = 3, C_STR = 2, C_COM = 10, C_NUM = 9, C_PRE = 8, C_DIM = 10 };
 
 static const std::unordered_set<std::string>& keywords(const std::string& lang) {
@@ -55,7 +53,6 @@ void Editor::load() {
     }
     if (lines_.empty()) lines_.push_back("");
     cy_ = cx_ = top_ = left_ = 0;
-    dirty_ = false;
     undo_.clear();
     set_lang_from_ext();
     original_ = content();
@@ -71,7 +68,7 @@ std::string Editor::content() const {
 bool Editor::save() {
     if (!save_fn_) { status_ = "no save handler"; return false; }
     std::string err = save_fn_(path_, content());
-    if (err.empty()) { dirty_ = false; original_ = content(); status_ = "wrote " + path_; return true; }
+    if (err.empty()) { original_ = content(); status_ = "wrote " + path_; return true; }
     status_ = "save failed: " + err;
     return false;
 }
@@ -88,7 +85,7 @@ void Editor::clamp() {
     if (cx_ > (int)lines_[cy_].size()) cx_ = (int)lines_[cy_].size();
 }
 
-void Editor::ensure_visible(int textrows, int textw, int /*numw*/) {
+void Editor::ensure_visible(int textrows, int textw, int) {
     if (cy_ < top_) top_ = cy_;
     if (cy_ >= top_ + textrows) top_ = cy_ - textrows + 1;
     if (top_ < 0) top_ = 0;
@@ -97,7 +94,6 @@ void Editor::ensure_visible(int textrows, int textw, int /*numw*/) {
     if (left_ < 0) left_ = 0;
 }
 
-// Per-character color for one line. `in_block` tracks /* */ across lines.
 std::vector<int> Editor::highlight(const std::string& s, bool& in_block) const {
     int n = (int)s.size();
     std::vector<int> col(n, C_TEXT);
@@ -138,8 +134,10 @@ std::vector<int> Editor::highlight(const std::string& s, bool& in_block) const {
     return col;
 }
 
-void Editor::render(void* vw, int rows, int cols) {
-    WINDOW* w = (WINDOW*)vw;
+void Editor::render() {
+    if (!win_) return;
+    WINDOW* w = (WINDOW*)win_;
+    int rows = rows_, cols = cols_;
     werase(w);
     int textrows = rows - 2;
     int numw = (int)std::to_string(std::max<size_t>(1, lines_.size())).size() + 1;
@@ -148,7 +146,7 @@ void Editor::render(void* vw, int rows, int cols) {
     if (textw < 1) textw = 1;
     ensure_visible(textrows, textw, numw);
 
-    std::string title = " edit: " + path_ + (dirty() ? "  [+]" : "");
+    std::string title = " edit: " + path_ + (dirty() ? "  [+]" : "") + "   (^W or F4: chat)";
     if ((int)title.size() > cols) title = title.substr(0, cols);
     title.resize(cols, ' ');
     wattron(w, A_REVERSE | COLOR_PAIR(C_KW));
@@ -185,7 +183,7 @@ void Editor::render(void* vw, int rows, int cols) {
     std::string modetag = mode_ == Mode::INSERT ? "-- INSERT --" : "-- NORMAL --";
     std::string left = " " + modetag + "  " + std::to_string(cy_ + 1) + ":" + std::to_string(cx_ + 1) +
                        (lang_.empty() ? "" : "  [" + lang_ + "]");
-    std::string right = (status_.empty() ? "i insert  :w save  :q quit  :q!/ZQ discard  ZZ save+quit " : status_ + " ");
+    std::string right = (status_.empty() ? "i insert  :w save  :q quit  :q! discard  ^W/F4 chat " : status_ + " ");
     std::string bar = left;
     int pad = cols - (int)left.size() - (int)right.size();
     if (pad > 0) bar += std::string(pad, ' ') + right; else bar = left.substr(0, cols);
@@ -201,31 +199,33 @@ void Editor::render(void* vw, int rows, int cols) {
     doupdate();
 }
 
-std::string Editor::prompt(void* vw, int rows, int cols, const std::string& label) {
-    WINDOW* w = (WINDOW*)vw;
+std::string Editor::prompt(const std::string& label) {
+    WINDOW* w = (WINDOW*)win_;
+    WINDOW* kw = (WINDOW*)(input_win_ ? input_win_ : win_);
     std::string buf;
     for (;;) {
         std::string bar = " " + label + buf;
-        if ((int)bar.size() > cols) bar = bar.substr(bar.size() - cols);
-        bar.resize(cols, ' ');
+        if ((int)bar.size() > cols_) bar = bar.substr(bar.size() - cols_);
+        bar.resize(cols_, ' ');
         wattron(w, A_REVERSE | COLOR_PAIR(C_PRE));
-        mvwaddstr(w, rows - 1, 0, bar.c_str());
+        mvwaddstr(w, rows_ - 1, 0, bar.c_str());
         wattroff(w, A_REVERSE | COLOR_PAIR(C_PRE));
-        wmove(w, rows - 1, std::min(cols - 1, (int)(1 + label.size() + buf.size())));
+        wmove(w, rows_ - 1, std::min(cols_ - 1, (int)(1 + label.size() + buf.size())));
         wnoutrefresh(w); doupdate();
-        int ch = wgetch(w);
+        int ch = wgetch(kw);
+        if (ch == ERR) continue;
         if (ch == 27) return std::string(1, '\x1b');
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) return buf;
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            if (buf.empty()) return std::string(1, '\x1b'); // backspace past start cancels
+            if (buf.empty()) return std::string(1, '\x1b');
             buf.pop_back(); continue;
         }
         if (ch >= 32 && ch < 127) buf += (char)ch;
     }
 }
 
-void Editor::search(void* vw, int rows, int cols) {
-    std::string q = prompt(vw, rows, cols, "/");
+void Editor::search() {
+    std::string q = prompt("/");
     if (!q.empty() && q[0] == '\x1b') { status_.clear(); return; }
     if (q.empty()) q = last_search_;
     if (q.empty()) { status_ = "no pattern"; return; }
@@ -238,10 +238,9 @@ void Editor::search_dir(bool forward) {
     const std::string& q = last_search_;
     int N = (int)lines_.size();
     if (forward) {
-        int sy = cy_, sx = cx_ + 1;
         for (int s = 0; s <= N; ++s) {
-            int ly = (sy + s) % N;
-            int from = (s == 0) ? sx : 0;
+            int ly = (cy_ + s) % N;
+            int from = (s == 0) ? cx_ + 1 : 0;
             auto pos = lines_[ly].find(q, std::max(0, from));
             if (pos != std::string::npos) { cy_ = ly; cx_ = (int)pos; status_ = "/" + q; return; }
         }
@@ -263,8 +262,8 @@ void Editor::word_forward() {
     const std::string& l = lines_[cy_];
     int n = (int)l.size(), i = cx_;
     auto isw = [](char c){ return std::isalnum((unsigned char)c) || c == '_'; };
-    if (i < n && isw(l[i])) while (i < n && isw(l[i])) i++;          // skip current word
-    while (i < n && !isw(l[i])) i++;                                 // skip spaces/punct
+    if (i < n && isw(l[i])) while (i < n && isw(l[i])) i++;
+    while (i < n && !isw(l[i])) i++;
     if (i >= n && cy_ < (int)lines_.size() - 1) { cy_++; cx_ = 0; } else cx_ = i;
 }
 
@@ -278,17 +277,16 @@ void Editor::word_back() {
     cx_ = i;
 }
 
-bool Editor::run_command(const std::string& cmd, bool& open) {
+void Editor::run_command(const std::string& cmd) {
     std::string c = cmd;
     while (!c.empty() && c.front() == ' ') c.erase(c.begin());
     while (!c.empty() && c.back() == ' ') c.pop_back();
-    if (c == "w") { save(); return true; }
-    if (c.rfind("w ", 0) == 0) { path_ = c.substr(2); set_lang_from_ext(); save(); return true; }
-    if (c == "q") { if (dirty()) { status_ = "unsaved changes — :q! or ZQ to discard, :wq/ZZ to save"; } else open = false; return true; }
-    if (c == "q!") { open = false; return true; }
-    if (c == "wq" || c == "x") { if (save()) open = false; return true; }
+    if (c == "w") { save(); return; }
+    if (c.rfind("w ", 0) == 0) { path_ = c.substr(2); set_lang_from_ext(); save(); return; }
+    if (c == "q") { if (dirty()) status_ = "unsaved changes — :q! or ZQ to discard, :wq/ZZ to save"; else want_close_ = true; return; }
+    if (c == "q!") { want_close_ = true; return; }
+    if (c == "wq" || c == "x") { if (save()) want_close_ = true; return; }
     status_ = "unknown command: :" + c;
-    return true;
 }
 
 void Editor::handle_insert(int ch) {
@@ -299,31 +297,31 @@ void Editor::handle_insert(int ch) {
     if (ch == KEY_LEFT)  { if (cx_ > 0) cx_--; return; }
     if (ch == KEY_RIGHT) { if (cx_ < (int)line.size()) cx_++; return; }
     if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-        if (cx_ > 0) { line.erase(cx_ - 1, 1); cx_--; dirty_ = true; }
-        else if (cy_ > 0) { int pl = (int)lines_[cy_ - 1].size(); lines_[cy_ - 1] += line; lines_.erase(lines_.begin() + cy_); cy_--; cx_ = pl; dirty_ = true; }
+        if (cx_ > 0) { line.erase(cx_ - 1, 1); cx_--; }
+        else if (cy_ > 0) { int pl = (int)lines_[cy_ - 1].size(); lines_[cy_ - 1] += line; lines_.erase(lines_.begin() + cy_); cy_--; cx_ = pl; }
         return;
     }
     if (ch == KEY_DC) {
-        if (cx_ < (int)line.size()) { line.erase(cx_, 1); dirty_ = true; }
-        else if (cy_ < (int)lines_.size() - 1) { line += lines_[cy_ + 1]; lines_.erase(lines_.begin() + cy_ + 1); dirty_ = true; }
+        if (cx_ < (int)line.size()) line.erase(cx_, 1);
+        else if (cy_ < (int)lines_.size() - 1) { line += lines_[cy_ + 1]; lines_.erase(lines_.begin() + cy_ + 1); }
         return;
     }
     if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         std::string rest = line.substr(cx_); line.erase(cx_);
-        lines_.insert(lines_.begin() + cy_ + 1, rest); cy_++; cx_ = 0; dirty_ = true; return;
+        lines_.insert(lines_.begin() + cy_ + 1, rest); cy_++; cx_ = 0; return;
     }
-    if (ch == '\t') { line.insert(cx_, 4, ' '); cx_ += 4; dirty_ = true; return; }
-    if (ch >= 32 && ch < 127) { line.insert(cx_, 1, (char)ch); cx_++; dirty_ = true; }
+    if (ch == '\t') { line.insert(cx_, 4, ' '); cx_ += 4; return; }
+    if (ch >= 32 && ch < 127) { line.insert(cx_, 1, (char)ch); cx_++; }
 }
 
-bool Editor::handle_normal(void* vw, int rows, int cols, int ch, bool& open) {
+bool Editor::handle_normal(int ch) {
     std::string& line = lines_[cy_];
     bool was_g = (pending_ == "g"), was_d = (pending_ == "d"), was_Z = (pending_ == "Z");
     pending_.clear();
 
     switch (ch) {
         case 'h': case KEY_LEFT:  if (cx_ > 0) cx_--; break;
-        case 'l': case KEY_RIGHT: if (cx_ < (int)line.size() - (line.empty()?0:1)) cx_++; else if (cx_ < (int)line.size()) cx_++; break;
+        case 'l': case KEY_RIGHT: if (cx_ < (int)line.size()) cx_++; break;
         case 'j': case KEY_DOWN:  if (cy_ < (int)lines_.size() - 1) cy_++; clamp(); break;
         case 'k': case KEY_UP:    if (cy_ > 0) cy_--; clamp(); break;
         case '0': case KEY_HOME:  cx_ = 0; break;
@@ -333,68 +331,78 @@ bool Editor::handle_normal(void* vw, int rows, int cols, int ch, bool& open) {
         case 'g': if (was_g) { cy_ = 0; clamp(); } else pending_ = "g"; break;
         case 'w': word_forward(); clamp(); break;
         case 'b': word_back(); clamp(); break;
-        case KEY_PPAGE: cy_ -= (rows - 3); clamp(); break;
-        case KEY_NPAGE: cy_ += (rows - 3); clamp(); break;
+        case KEY_PPAGE: cy_ -= (rows_ - 3); clamp(); break;
+        case KEY_NPAGE: cy_ += (rows_ - 3); clamp(); break;
 
         case 'i': push_undo(); mode_ = Mode::INSERT; break;
         case 'a': push_undo(); mode_ = Mode::INSERT; if (cx_ < (int)line.size()) cx_++; break;
         case 'I': push_undo(); mode_ = Mode::INSERT; { int i=0; while(i<(int)line.size()&&(line[i]==' '||line[i]=='\t'))i++; cx_=i; } break;
         case 'A': push_undo(); mode_ = Mode::INSERT; cx_ = (int)line.size(); break;
-        case 'o': push_undo(); lines_.insert(lines_.begin() + cy_ + 1, ""); cy_++; cx_ = 0; mode_ = Mode::INSERT; dirty_ = true; break;
-        case 'O': push_undo(); lines_.insert(lines_.begin() + cy_, ""); cx_ = 0; mode_ = Mode::INSERT; dirty_ = true; break;
+        case 'o': push_undo(); lines_.insert(lines_.begin() + cy_ + 1, ""); cy_++; cx_ = 0; mode_ = Mode::INSERT; break;
+        case 'O': push_undo(); lines_.insert(lines_.begin() + cy_, ""); cx_ = 0; mode_ = Mode::INSERT; break;
 
-        case 'x': if (cx_ < (int)line.size()) { push_undo(); line.erase(cx_, 1); dirty_ = true; clamp(); } break;
-        case 'D': if (cx_ < (int)line.size()) { push_undo(); line.erase(cx_); dirty_ = true; clamp(); } break;
+        case 'x': if (cx_ < (int)line.size()) { push_undo(); line.erase(cx_, 1); clamp(); } break;
+        case 'D': if (cx_ < (int)line.size()) { push_undo(); line.erase(cx_); clamp(); } break;
         case 'd':
             if (was_d) {
                 push_undo();
                 if (lines_.size() == 1) lines_[0].clear();
                 else { lines_.erase(lines_.begin() + cy_); if (cy_ >= (int)lines_.size()) cy_ = (int)lines_.size() - 1; }
-                cx_ = 0; dirty_ = true;
+                cx_ = 0;
             } else pending_ = "d";
             break;
 
-        case 'Z': if (was_Z) { if (save()) open = false; } else pending_ = "Z"; break;
-        case 'Q': if (was_Z) open = false; break;  // ZQ: quit, discard changes
-        case 'u': if (!undo_.empty()) { auto s = undo_.back(); undo_.pop_back(); lines_ = s.lines; cy_ = s.cy; cx_ = s.cx; clamp(); dirty_ = true; status_ = "undo"; } else status_ = "nothing to undo"; break;
+        case 'Z': if (was_Z) { if (save()) want_close_ = true; } else pending_ = "Z"; break;
+        case 'Q': if (was_Z) want_close_ = true; break;
+        case 'u': if (!undo_.empty()) { auto s = undo_.back(); undo_.pop_back(); lines_ = s.lines; cy_ = s.cy; cx_ = s.cx; clamp(); status_ = "undo"; } else status_ = "nothing to undo"; break;
 
-        case '/': search(vw, rows, cols); break;
+        case '/': search(); break;
         case 'n': search_dir(true); break;
         case 'N': search_dir(false); break;
 
-        case ':': {
-            std::string cmd = prompt(vw, rows, cols, ":");
-            if (cmd.empty() || cmd[0] != '\x1b') run_command(cmd, open);
-            break;
-        }
-        case 27: status_.clear(); break; // Esc in normal: clear pending/status
+        case ':': { std::string cmd = prompt(":"); if (!cmd.empty() && cmd[0] != '\x1b') run_command(cmd); break; }
+        case 27: status_.clear(); break;
         default: break;
     }
-    return open;
+    return want_close_;
 }
 
-void Editor::run(const std::string& path, int x, int y, int ww, int hh) {
+int Editor::read_key() {
+    if (!input_win_) return ERR;
+    return wgetch((WINDOW*)input_win_);
+}
+
+bool Editor::handle_key(int ch) {
+    if (ch == ERR) return false;
+    if (mode_ == Mode::INSERT) { handle_insert(ch); return false; }
+    return handle_normal(ch);
+}
+
+void Editor::open(const std::string& path, int x, int y, int w, int h, void* input_win) {
+    if (open_) close();
     path_ = path;
     load();
     mode_ = Mode::NORMAL;
-    int rows = hh, cols = ww;
-    set_escdelay(25);                 // make a lone Esc responsive
-    WINDOW* w = newwin(rows, cols, y, x);
-    keypad(w, TRUE);
-    wtimeout(w, -1);
+    status_.clear();
+    want_close_ = false;
+    rows_ = h; cols_ = w;
+    set_escdelay(25);
+    win_ = newwin(h, w, y, x);
+    keypad((WINDOW*)win_, TRUE);  // keep the terminal in keypad mode across this window's refreshes
+    input_win_ = input_win;       // but read keys from the host window (its keypad is known-good)
+    open_ = true;
     curs_set(1);
+}
 
-    bool open = true;
-    while (open) {
-        render(w, rows, cols);
-        int ch = wgetch(w);
-        if (mode_ == Mode::INSERT) handle_insert(ch);
-        else handle_normal(w, rows, cols, ch, open);
+void Editor::close() {
+    if (win_) {
+        WINDOW* w = (WINDOW*)win_;
+        werase(w); wnoutrefresh(w); doupdate();
+        delwin(w);
+        win_ = nullptr;
     }
-
+    open_ = false;
     curs_set(0);
-    werase(w); wnoutrefresh(w); doupdate();
-    delwin(w);
 }
 
 } // namespace egodeath

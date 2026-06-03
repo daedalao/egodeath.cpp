@@ -621,6 +621,7 @@ void Agent::turn_async(int depth) {
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_items","description":"List tasks and/or events from the store. Defaults to open items in this directory plus global.","parameters":{"type":"object","properties":{"kind":{"type":"string","description":"task, event, or all (default all)"},"status":{"type":"string","description":"open, done, cancelled, or all (default open)"},"from":{"type":"string","description":"Earliest date YYYY-MM-DD (optional)"},"to":{"type":"string","description":"Latest date YYYY-MM-DD (optional)"},"scope":{"type":"string","description":"project (this directory), global, or all (default all)"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"complete_item","description":"Mark a task or event done by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_item","description":"Delete a task or event by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"ask_user","description":"Ask the user a multiple-choice question and wait for their pick. Use it to get guidance or confirm a direction, especially while building something. Give 2-5 short, distinct options.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"2 to 5 short options to choose from"}},"required":["question","options"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"open_editor","description":"Open a file in the in-app code editor so the user can view or edit it. The pane appears in the user\u0027s TUI.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path to open"}},"required":["path"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"get_settings","description":"Return the user\u0027s persisted settings from config.json.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"set_setting","description":"Change one setting and persist it to config.json. Live-applies theme, editor_dock, web_search, shell, auto_approve, reasoning_effort, compact_at; endpoint/model/ctx take effect on restart.","parameters":{"type":"object","properties":{"key":{"type":"string","description":"Setting name, e.g. theme, editor_dock, web_search, shell, auto_approve, reasoning_effort, compact_at"},"value":{"description":"New value (string, boolean, or number depending on the setting)"}},"required":["key","value"]}}})SCHEMA"));
@@ -858,6 +859,19 @@ void Agent::turn_async(int depth) {
                 } else if (name == "remove_item") {
                     std::string e; bool ok = store_ && store_->remove(json_id(args), e);
                     res = ok ? "removed" : "error: " + e;
+                } else if (name == "ask_user") {
+                    std::string q = args.value("question", "");
+                    std::vector<std::string> opts;
+                    if (args.contains("options") && args["options"].is_array())
+                        for (auto& o : args["options"]) {
+                            if (o.is_string()) opts.push_back(o.get<std::string>());
+                            else if (o.is_object() && o.contains("label") && o["label"].is_string()) opts.push_back(o["label"].get<std::string>());
+                        }
+                    if (q.empty() || opts.size() < 2) res = "error: ask_user needs 'question' and at least 2 string 'options'";
+                    else {
+                        int idx = tui_.ask_choice(q, opts);
+                        res = idx < 0 ? "[user dismissed the question without choosing]" : "user selected: " + opts[idx];
+                    }
                 } else if (name == "open_editor") {
                     std::string p = args.value("path", "");
                     if (p.empty()) res = "error: path required";

@@ -18,6 +18,8 @@ enum class StatusType {
     PROCESSING, // general processing (e.g., loading, parsing)
 };
 
+enum class Focus { CHAT, EDITOR };
+
 enum class InputMode {
     NORMAL,              // standard input mode (default)
     SEARCH,              // fuzzy search mode (Ctrl+F)
@@ -63,6 +65,7 @@ public:
     void set_effort_callback(std::function<void(const std::string&)> cb) { effort_callback_ = std::move(cb); }
     void set_initial_effort(const std::string& e) { reasoning_effort_ = e; }
     int request_tool_approval(const std::string& prompt); // worker thread: 0 deny, 1 once, 2 always
+    int ask_choice(const std::string& question, const std::vector<std::string>& options); // blocks; -1 if dismissed
     void set_theme(const std::string& name);
     std::string current_theme() const { return theme_; }
     void cycle_theme();
@@ -109,6 +112,8 @@ private:
     void _render_help();
     bool _complete_path(std::string& buf, int& pos);
     void _render_agenda();
+    void _render_choice();
+    void close_editor();
     void _agenda_refetch();
     std::string _agenda_add_prompt();
     void _apply_theme(const std::string& name);
@@ -181,6 +186,7 @@ private:
     int agenda_sel_ = 0;
     Editor editor_;
     std::atomic<bool> editor_active_{false};
+    Focus focus_ = Focus::CHAT;
     std::function<std::string()> last_file_provider_;
     std::string editor_dock_ = "right";
     int rsv_left_ = 0, rsv_right_ = 0, rsv_bottom_ = 0; // region reserved for the editor pane
@@ -195,6 +201,13 @@ private:
     std::condition_variable approval_cv_;
     std::string approval_prompt_;
     int approval_result_ = -1;
+    std::atomic<bool> choice_pending_{false};
+    std::mutex choice_mtx_;
+    std::condition_variable choice_cv_;
+    std::string choice_question_;
+    std::vector<std::string> choice_options_;
+    int choice_selected_ = 0;
+    int choice_result_ = -1;
     int input_lines_ = 1;
     
     // Recent throughput for sparkline

@@ -178,6 +178,47 @@ int ProTUI::request_tool_approval(const std::string& prompt) {
     return approval_result_ < 0 ? 0 : approval_result_;
 }
 
+int ProTUI::ask_choice(const std::string& question, const std::vector<std::string>& options) {
+    std::unique_lock<std::mutex> lk(choice_mtx_);
+    choice_question_ = question;
+    choice_options_ = options;
+    choice_selected_ = 0;
+    choice_result_ = -1;
+    choice_pending_.store(true);
+    choice_cv_.wait(lk, [this]() { return !choice_pending_.load() || !running_; });
+    return choice_result_;
+}
+
+void ProTUI::_render_choice() {
+    if (!hist_win_) return;
+    werase(hist_win_);
+    int h = getmaxy(hist_win_), w = getmaxx(hist_win_);
+    int r = 1;
+    wattron(hist_win_, A_BOLD | COLOR_PAIR(3));
+    for (const auto& ln : _wrap_text("? " + choice_question_, w - 4)) {
+        if (r >= h) break;
+        mvwaddstr(hist_win_, r++, 2, ln.c_str());
+    }
+    wattroff(hist_win_, A_BOLD | COLOR_PAIR(3));
+    r++;
+    for (int i = 0; i < (int)choice_options_.size() && r < h; ++i) {
+        bool sel = (i == choice_selected_);
+        std::string opt = fmt::format(" {} {}. {}", sel ? "\xe2\x96\xb8" : " ", i + 1, choice_options_[i]);
+        if ((int)opt.size() > w - 3) opt = opt.substr(0, w - 3);
+        if (sel) wattron(hist_win_, A_REVERSE | COLOR_PAIR(2));
+        else     wattron(hist_win_, COLOR_PAIR(4));
+        mvwaddstr(hist_win_, r++, 2, opt.c_str());
+        if (sel) wattroff(hist_win_, A_REVERSE | COLOR_PAIR(2));
+        else     wattroff(hist_win_, COLOR_PAIR(4));
+    }
+    wnoutrefresh(hist_win_);
+    werase(status_win_);
+    wattron(status_win_, COLOR_PAIR(9));
+    mvwaddstr(status_win_, 0, 1, "\xe2\x86\x91/\xe2\x86\x93 or j/k select  \xc2\xb7  1-9 pick  \xc2\xb7  Enter confirm  \xc2\xb7  Esc dismiss");
+    wattroff(status_win_, COLOR_PAIR(9));
+    wnoutrefresh(status_win_);
+}
+
 int ProTUI::_get_color_for_type(const std::string& type) const {
     if (type == "user")        return 5;  // black on light gray
     if (type == "user_queued") return 10; // dim gray
@@ -421,6 +462,8 @@ void ProTUI::_render_command_palette() {
 
 void ProTUI::open_editor(const std::string& path) {
     if (path.empty()) { set_status(StatusType::IDLE, "no file to edit (try /edit <path>)"); refresh_ui(true); return; }
+    if (editor_.is_open()) editor_.close();
+    rsv_left_ = rsv_right_ = rsv_bottom_ = 0;
     int y, x; getmaxyx(stdscr, y, x);
     int ex = 0, ey = 0, ew = x, eh = y;
     const std::string& dock = editor_dock_;
@@ -429,12 +472,21 @@ void ProTUI::open_editor(const std::string& path) {
     else if (dock == "right")  { ew = std::max(30, (int)(x * 0.5)); eh = y; ey = 0; ex = x - ew; rsv_right_ = ew; }
     // "full" reserves nothing and covers the whole screen.
 
-    if (dock != "full") { _setup_windows(); refresh_ui(true); } // draw chat in its reduced area first
-    editor_active_.store(true);
-    editor_.run(path, ex, ey, ew, eh);
+    // Lay out and draw the chat in its (reduced) region once, then open the pane.
     editor_active_.store(false);
+    _setup_windows();
+    refresh_ui(true);
+    editor_.open(path, ex, ey, ew, eh, in_win_);
+    focus_ = Focus::EDITOR;
+    editor_active_.store(true);    // freeze the chat while the editor has focus
+    editor_.render();
+}
+
+void ProTUI::close_editor() {
+    editor_.close();
     rsv_left_ = rsv_right_ = rsv_bottom_ = 0;
-    curs_set(0);
+    focus_ = Focus::CHAT;
+    editor_active_.store(false);
     _setup_windows();
     refresh_ui(true);
 }
@@ -583,7 +635,7 @@ void ProTUI::_render_help() {
         {"  ! <cmd>  run a shell command",       "  @path          attach/inject a file"},
         {"  /agenda /tasks  task & calendar view", "  F2             toggle agenda view"},
         {"  /edit <path>    open code editor",     "  F3             edit last agent file"},
-        {"  /editdock l|r|bottom|full  pane side", "  (vim keys: :q quit, i insert)"},
+        {"  /editdock l|r|bottom|full  pane side", "  F4 / ^W        switch editor / chat focus"},
     };
 
     int c2 = w / 2;
@@ -655,6 +707,7 @@ void ProTUI::_render_history() {
 
     if (input_mode_ == InputMode::HELP) { _render_help(); return; }
     if (input_mode_ == InputMode::AGENDA) { _render_agenda(); return; }
+    if (choice_pending_.load()) { _render_choice(); return; }
 
     // If in command palette mode, render command palette instead of history
     if (input_mode_ == InputMode::COMMAND_PALETTE) {
@@ -920,6 +973,8 @@ void ProTUI::_draw_status() {
         return;
     }
     
+    if (choice_pending_.load()) return; // _render_choice draws the status hint
+
     // Skip drawing status if in search or command palette mode (handled in _render_history)
     if (input_mode_ == InputMode::SEARCH || input_mode_ == InputMode::COMMAND_PALETTE || input_mode_ == InputMode::HELP) return;
     
@@ -1064,6 +1119,40 @@ std::string ProTUI::get_input() {
     };
 
     while (true) {
+        // If the agent needs the user while the editor has focus, pull focus back to chat.
+        if ((choice_pending_.load() || approval_pending_.load()) && focus_ == Focus::EDITOR) {
+            focus_ = Focus::CHAT; editor_active_.store(false); refresh_ui(true);
+        }
+        // Editor pane has focus: route keys to it (F4 returns to the chat).
+        if (editor_.is_open() && focus_ == Focus::EDITOR &&
+            !choice_pending_.load() && !approval_pending_.load()) {
+            editor_.render();
+            int ech = editor_.read_key();
+            if (ech == ERR) continue;
+            if (ech == KEY_F(4) || ech == 23) { focus_ = Focus::CHAT; editor_active_.store(false); refresh_ui(true); continue; }
+            if (editor_.handle_key(ech)) close_editor();
+            continue;
+        }
+        // Multiple-choice question requested by the agent (arrows/number/Enter).
+        if (choice_pending_.load()) {
+            refresh_ui();
+            int cch = wgetch(in_win_);
+            if (cch != ERR) {
+                int n = (int)choice_options_.size();
+                bool done = false; int result = -1;
+                if (cch == KEY_UP || cch == 'k') { if (choice_selected_ > 0) choice_selected_--; }
+                else if (cch == KEY_DOWN || cch == 'j') { if (choice_selected_ < n - 1) choice_selected_++; }
+                else if (cch >= '1' && cch <= '9') { int d = cch - '1'; if (d < n) { choice_selected_ = d; result = d; done = true; } }
+                else if (cch == '\n' || cch == '\r' || cch == KEY_ENTER) { result = choice_selected_; done = true; }
+                else if (cch == 27) { result = -1; done = true; }
+                if (done) {
+                    { std::lock_guard<std::mutex> lk(choice_mtx_); choice_result_ = result; }
+                    choice_pending_.store(false);
+                    choice_cv_.notify_all();
+                }
+            }
+            continue;
+        }
         // Tool-approval prompt requested by the worker thread (y/n/a).
         if (approval_pending_.load()) {
             refresh_ui();
@@ -1167,6 +1256,10 @@ std::string ProTUI::get_input() {
         }
         if (ch == KEY_F(3)) {
             open_editor(last_file_provider_ ? last_file_provider_() : std::string());
+            continue;
+        }
+        if (ch == KEY_F(4) && editor_.is_open()) {
+            focus_ = Focus::EDITOR; editor_active_.store(true); editor_.render();
             continue;
         }
         if (input_mode_ == InputMode::AGENDA) {
