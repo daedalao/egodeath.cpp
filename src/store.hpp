@@ -27,6 +27,7 @@ struct Item {
     std::string end_ts;
     std::string created_ts;
     std::string updated_ts;
+    std::string project;  // "" = global, else a directory key (per-directory list)
 
     // The chronological anchor used for sorting/grouping (event start, else due).
     std::string when() const { return kind == "event" && !start_ts.empty() ? start_ts : due; }
@@ -50,7 +51,8 @@ public:
     // Queries. Empty filter string means "any". due_from/due_to bound the `when`
     // anchor (inclusive); empty means unbounded. limit <= 0 means no limit.
     std::vector<Item> list(const std::string& kind, const std::string& status,
-                           const std::string& from, const std::string& to, int limit);
+                           const std::string& from, const std::string& to, int limit,
+                           const std::vector<std::string>& projects = {});
     std::optional<Item> get(long long id);
 
 private:

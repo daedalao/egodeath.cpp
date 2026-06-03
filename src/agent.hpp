@@ -98,6 +98,7 @@ private:
     McpManager mcp_;
     std::unique_ptr<Store> store_;
     std::filesystem::path config_dir_;
+    std::string project_key_;  // per-directory task scope (the launch directory)
     json read_config();
     std::string write_config(const json& cfg);
     std::string last_file_;

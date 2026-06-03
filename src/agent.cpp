@@ -49,6 +49,9 @@ Agent::Agent(LlamaClient::Config cfg, ProTUI& tui, std::filesystem::path project
             ? fs::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
             : fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".config" / "egodeath";
         store_ = std::make_unique<Store>(config_dir_ / "egodeath.db");
+        std::error_code _pec;
+        project_key_ = fs::weakly_canonical(fs::current_path(), _pec).string();
+        if (_pec) project_key_ = fs::current_path().string();
     }
 
     // Connect any configured MCP servers (EGODEATH_MCP_CONFIG, else .egodeath/mcp.json).
@@ -467,7 +470,7 @@ std::string Agent::editor_save(const std::string& path, const std::string& conte
 json Agent::agenda_snapshot() {
     json arr = json::array();
     if (!store_) return arr;
-    for (auto& it : store_->list("all", "all", "", "", 200)) arr.push_back(it.to_json());
+    for (auto& it : store_->list("all", "all", "", "", 200, {std::string(), project_key_})) arr.push_back(it.to_json());
     return arr;
 }
 
@@ -481,7 +484,7 @@ std::string Agent::agenda_action(const std::string& op, long long id, const std:
     }
     if (op == "delete") return store_->remove(id, e) ? "" : e;
     if (op == "add") {
-        Item t; t.kind = "task"; t.title = arg;
+        Item t; t.kind = "task"; t.title = arg; t.project = project_key_;
         return store_->add(t, e) > 0 ? "" : e;
     }
     return "unknown op";
@@ -613,9 +616,9 @@ void Agent::turn_async(int depth) {
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"save_memory","description":"Persist a fact to long-term memory across sessions.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Short unique slug"},"description":{"type":"string","description":"One-line summary of what this memory contains"},"fact":{"type":"string","description":"The content to store"},"type":{"type":"string","description":"Category: user, project, feedback, or reference"},"scope":{"type":"string","description":"global or project, defaults to global"}},"required":["name","description","fact"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"recall_memory","description":"Retrieve memories. Use an empty query string to get ALL memories. Pass keywords to filter by name or description.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Keyword filter. Empty string returns all memories."},"scope":{"type":"string","description":"all, global, or project. defaults to all"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_memory","description":"Delete a memory entry by its name slug.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The name slug of the memory to delete"}},"required":["name"]}}})SCHEMA"));
-    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_task","description":"Add a task to the SQLite task/calendar store. Tasks appear in the agenda view.","parameters":{"type":"object","properties":{"title":{"type":"string"},"notes":{"type":"string"},"priority":{"type":"string","description":"low, med, or high"},"due":{"type":"string","description":"Due date YYYY-MM-DD (optional)"}},"required":["title"]}}})SCHEMA"));
-    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_event","description":"Add a calendar event with a start time (and optional end) to the store.","parameters":{"type":"object","properties":{"title":{"type":"string"},"start":{"type":"string","description":"Start as YYYY-MM-DD or YYYY-MM-DDTHH:MM"},"end":{"type":"string","description":"End (optional)"},"notes":{"type":"string"}},"required":["title","start"]}}})SCHEMA"));
-    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_items","description":"List tasks and/or events from the store. Defaults to open items.","parameters":{"type":"object","properties":{"kind":{"type":"string","description":"task, event, or all (default all)"},"status":{"type":"string","description":"open, done, cancelled, or all (default open)"},"from":{"type":"string","description":"Earliest date YYYY-MM-DD (optional)"},"to":{"type":"string","description":"Latest date YYYY-MM-DD (optional)"}}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_task","description":"Add a task to the task/calendar store.","parameters":{"type":"object","properties":{"title":{"type":"string"},"notes":{"type":"string"},"priority":{"type":"string","description":"low, med, or high"},"due":{"type":"string","description":"Due date YYYY-MM-DD (optional)"},"scope":{"type":"string","description":"project (this directory, default) or global"}},"required":["title"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_event","description":"Add a calendar event with a start time (and optional end) to the store.","parameters":{"type":"object","properties":{"title":{"type":"string"},"start":{"type":"string","description":"Start as YYYY-MM-DD or YYYY-MM-DDTHH:MM"},"end":{"type":"string","description":"End (optional)"},"notes":{"type":"string"},"scope":{"type":"string","description":"project (this directory, default) or global"}},"required":["title","start"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_items","description":"List tasks and/or events from the store. Defaults to open items in this directory plus global.","parameters":{"type":"object","properties":{"kind":{"type":"string","description":"task, event, or all (default all)"},"status":{"type":"string","description":"open, done, cancelled, or all (default open)"},"from":{"type":"string","description":"Earliest date YYYY-MM-DD (optional)"},"to":{"type":"string","description":"Latest date YYYY-MM-DD (optional)"},"scope":{"type":"string","description":"project (this directory), global, or all (default all)"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"complete_item","description":"Mark a task or event done by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_item","description":"Delete a task or event by its numeric id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"open_editor","description":"Open a file in the in-app code editor so the user can view or edit it. The pane appears in the user\u0027s TUI.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path to open"}},"required":["path"]}}})SCHEMA"));
@@ -827,19 +830,25 @@ void Agent::turn_async(int depth) {
                     Item it; it.kind = "task"; it.title = args.value("title", "");
                     it.notes = args.value("notes", ""); it.priority = args.value("priority", "");
                     it.due = args.value("due", "");
+                    it.project = args.value("scope", "project") == "global" ? "" : project_key_;
                     std::string e; long long id = store_ ? store_->add(it, e) : -1;
                     res = id > 0 ? fmt::format("task #{} added: {}", id, it.title) : "error: " + e;
                 } else if (name == "add_event") {
                     Item it; it.kind = "event"; it.title = args.value("title", "");
                     it.notes = args.value("notes", ""); it.start_ts = args.value("start", "");
                     it.end_ts = args.value("end", "");
+                    it.project = args.value("scope", "project") == "global" ? "" : project_key_;
                     std::string e; long long id = store_ ? store_->add(it, e) : -1;
                     res = id > 0 ? fmt::format("event #{} added: {}", id, it.title) : "error: " + e;
                 } else if (name == "list_items") {
                     if (!store_) { res = "error: store unavailable"; }
                     else {
+                        std::string sc = args.value("scope", "all");
+                        std::vector<std::string> projs = sc == "global" ? std::vector<std::string>{std::string()}
+                                                       : sc == "project" ? std::vector<std::string>{project_key_}
+                                                       : std::vector<std::string>{std::string(), project_key_};
                         auto items = store_->list(args.value("kind", "all"), args.value("status", "open"),
-                                                  args.value("from", ""), args.value("to", ""), 100);
+                                                  args.value("from", ""), args.value("to", ""), 100, projs);
                         if (items.empty()) res = "(no items)";
                         else for (auto& it : items) res += it.one_line() + "\n";
                     }

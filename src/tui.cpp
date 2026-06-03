@@ -514,8 +514,9 @@ void ProTUI::_render_agenda() {
         std::string pritag = pri == "high" ? " !hi" : pri == "med" ? " ~md" : pri == "low" ? " .lo" : "";
         std::string when = kind == "event" ? it.value("start", "") : it.value("due", "");
         long long id = it.value("id", (long long)0);
+        std::string scopetag = it.value("scope", "project") == "global" ? "  \xc2\xb7g" : "";
         std::string left = std::string(selected ? "\xe2\x96\xb8" : " ") + " " + box +
-                           " #" + std::to_string(id) + " " + it.value("title", "") + pritag;
+                           " #" + std::to_string(id) + " " + it.value("title", "") + pritag + scopetag;
         std::string full = left;
         int pad = w - vlen(left) - (int)when.size() - 1;
         if (pad > 0 && !when.empty()) full += std::string(pad, ' ') + when;

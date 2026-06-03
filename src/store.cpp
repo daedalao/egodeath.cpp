@@ -27,6 +27,7 @@ json Item::to_json() const {
     if (!due.empty())      j["due"] = due;
     if (!start_ts.empty()) j["start"] = start_ts;
     if (!end_ts.empty())   j["end"] = end_ts;
+    j["scope"] = project.empty() ? "global" : "project";
     return j;
 }
 
@@ -63,6 +64,8 @@ Store::Store(std::filesystem::path db_path) {
          "created_ts TEXT NOT NULL DEFAULT '',"
          "updated_ts TEXT NOT NULL DEFAULT ''"
          ");");
+    exec("ALTER TABLE items ADD COLUMN project TEXT NOT NULL DEFAULT '';");  // ignored if present
+    last_error_.clear();
     exec("CREATE INDEX IF NOT EXISTS idx_items_when ON items(status, kind, due, start_ts);");
 }
 
@@ -82,8 +85,8 @@ long long Store::add(const Item& it, std::string& err) {
     if (!db_) { err = "store unavailable"; return -1; }
     if (it.title.empty()) { err = "title is required"; return -1; }
     const char* sql = "INSERT INTO items"
-        "(kind,title,notes,status,priority,due,start_ts,end_ts,created_ts,updated_ts)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?);";
+        "(kind,title,notes,status,priority,due,start_ts,end_ts,created_ts,updated_ts,project)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?);";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) { err = sqlite3_errmsg(db_); return -1; }
     std::string now = now_iso();
@@ -91,7 +94,7 @@ long long Store::add(const Item& it, std::string& err) {
     std::string status = it.status.empty() ? "open" : it.status;
     auto T = [&](int i, const std::string& v) { sqlite3_bind_text(st, i, v.c_str(), -1, SQLITE_TRANSIENT); };
     T(1, kind); T(2, it.title); T(3, it.notes); T(4, status); T(5, it.priority);
-    T(6, it.due); T(7, it.start_ts); T(8, it.end_ts); T(9, now); T(10, now);
+    T(6, it.due); T(7, it.start_ts); T(8, it.end_ts); T(9, now); T(10, now); T(11, it.project);
     if (sqlite3_step(st) != SQLITE_DONE) { err = sqlite3_errmsg(db_); sqlite3_finalize(st); return -1; }
     sqlite3_finalize(st);
     return sqlite3_last_insert_rowid(db_);
@@ -163,19 +166,25 @@ bool Store::remove(long long id, std::string& err) {
 }
 
 std::vector<Item> Store::list(const std::string& kind, const std::string& status,
-                              const std::string& from, const std::string& to, int limit) {
+                              const std::string& from, const std::string& to, int limit,
+                              const std::vector<std::string>& projects) {
     std::lock_guard<std::mutex> lk(mtx_);
     std::vector<Item> out;
     if (!db_) return out;
     // The chronological anchor: event start, else task due.
     const std::string whencol = "(CASE WHEN kind='event' THEN start_ts ELSE due END)";
-    std::string sql = "SELECT id,kind,title,notes,status,priority,due,start_ts,end_ts,created_ts,updated_ts"
+    std::string sql = "SELECT id,kind,title,notes,status,priority,due,start_ts,end_ts,created_ts,updated_ts,project"
                       " FROM items WHERE 1=1";
     std::vector<std::string> binds;
     if (!kind.empty() && kind != "all")     { sql += " AND kind=?";   binds.push_back(kind); }
     if (!status.empty() && status != "all") { sql += " AND status=?"; binds.push_back(status); }
     if (!from.empty()) { sql += " AND " + whencol + " <> '' AND " + whencol + " >= ?"; binds.push_back(from); }
     if (!to.empty())   { sql += " AND " + whencol + " <> '' AND " + whencol + " <= ?"; binds.push_back(to); }
+    if (!projects.empty()) {
+        sql += " AND project IN (";
+        for (size_t i = 0; i < projects.size(); ++i) { sql += (i ? ",?" : "?"); binds.push_back(projects[i]); }
+        sql += ")";
+    }
     sql += " ORDER BY (" + whencol + " = '') ASC, " + whencol + " ASC,"
            " CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, id ASC";
     if (limit > 0) sql += " LIMIT " + std::to_string(limit);
@@ -191,7 +200,7 @@ std::vector<Item> Store::list(const std::string& kind, const std::string& status
         it.kind = col_text(st, 1); it.title = col_text(st, 2); it.notes = col_text(st, 3);
         it.status = col_text(st, 4); it.priority = col_text(st, 5); it.due = col_text(st, 6);
         it.start_ts = col_text(st, 7); it.end_ts = col_text(st, 8);
-        it.created_ts = col_text(st, 9); it.updated_ts = col_text(st, 10);
+        it.created_ts = col_text(st, 9); it.updated_ts = col_text(st, 10); it.project = col_text(st, 11);
         out.push_back(std::move(it));
     }
     sqlite3_finalize(st);
@@ -203,7 +212,7 @@ std::optional<Item> Store::get(long long id) {
     if (!db_) return std::nullopt;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
-        "SELECT id,kind,title,notes,status,priority,due,start_ts,end_ts,created_ts,updated_ts"
+        "SELECT id,kind,title,notes,status,priority,due,start_ts,end_ts,created_ts,updated_ts,project"
         " FROM items WHERE id=?;", -1, &st, nullptr) != SQLITE_OK) return std::nullopt;
     sqlite3_bind_int64(st, 1, id);
     std::optional<Item> res;
@@ -213,7 +222,7 @@ std::optional<Item> Store::get(long long id) {
         it.kind = col_text(st, 1); it.title = col_text(st, 2); it.notes = col_text(st, 3);
         it.status = col_text(st, 4); it.priority = col_text(st, 5); it.due = col_text(st, 6);
         it.start_ts = col_text(st, 7); it.end_ts = col_text(st, 8);
-        it.created_ts = col_text(st, 9); it.updated_ts = col_text(st, 10);
+        it.created_ts = col_text(st, 9); it.updated_ts = col_text(st, 10); it.project = col_text(st, 11);
         res = std::move(it);
     }
     sqlite3_finalize(st);
