@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <filesystem>
 
 namespace egodeath {
 
@@ -1452,50 +1453,40 @@ std::string ProTUI::get_input() {
                 }
             }
         }
-        else if (ch == 9) { // Tab: autocomplete slash commands and their arguments
-            if (!buf.empty() && buf[0] == '/') {
-                size_t sp = buf.find(' ');
-                if (sp == std::string::npos) {
-                    static const std::vector<std::string> cmds = {
-                        "/save", "/load", "/reset", "/clear", "/toggle-reasoning",
-                        "/effort", "/theme", "/web", "/auto", "/shell", "/undo", "/mcp", "/exit"
-                    };
+        else if (ch == 9) { // Tab: complete slash commands, their enum args, or file paths
+            bool slash = !buf.empty() && buf[0] == '/';
+            size_t sp = buf.find(' ');
+            if (slash && sp == std::string::npos) {
+                static const std::vector<std::string> cmds = {
+                    "/save", "/load", "/reset", "/clear", "/toggle-reasoning", "/effort",
+                    "/theme", "/web", "/auto", "/shell", "/undo", "/mcp", "/agenda", "/tasks",
+                    "/edit", "/editdock", "/exit"
+                };
+                std::vector<std::string> matches;
+                for (const auto& cm : cmds) if (cm.rfind(buf, 0) == 0) matches.push_back(cm);
+                if (matches.size() == 1) { buf = matches[0] + " "; pos = (int)buf.size(); }
+                else if (matches.size() > 1) {
+                    std::string lcp = matches[0];
+                    for (const auto& m : matches) { size_t k = 0; while (k < lcp.size() && k < m.size() && lcp[k] == m[k]) k++; lcp = lcp.substr(0, k); }
+                    if (lcp.size() > buf.size()) { buf = lcp; pos = (int)buf.size(); }
+                    std::string opts; for (const auto& m : matches) opts += m + "  ";
+                    set_status(StatusType::PROCESSING, opts);
+                }
+            } else {
+                std::string cmd = slash ? buf.substr(0, sp) : "";
+                std::string arg = slash ? buf.substr(sp + 1) : buf;
+                std::vector<std::string> opts;
+                if (cmd == "/theme") opts = {"dark", "matrix", "amber", "mono"};
+                else if (cmd == "/effort") opts = {"low", "medium", "high"};
+                else if (cmd == "/web" || cmd == "/auto" || cmd == "/shell") opts = {"on", "off"};
+                else if (cmd == "/editdock") opts = {"left", "right", "bottom", "full"};
+                if (!opts.empty()) {
                     std::vector<std::string> matches;
-                    for (const auto& cm : cmds) if (cm.rfind(buf, 0) == 0) matches.push_back(cm);
-                    if (matches.size() == 1) {
-                        buf = matches[0] + " ";
-                        pos = (int)buf.size();
-                    } else if (matches.size() > 1) {
-                        std::string lcp = matches[0];
-                        for (const auto& m : matches) {
-                            size_t k = 0;
-                            while (k < lcp.size() && k < m.size() && lcp[k] == m[k]) k++;
-                            lcp = lcp.substr(0, k);
-                        }
-                        if (lcp.size() > buf.size()) { buf = lcp; pos = (int)buf.size(); }
-                        std::string opts;
-                        for (const auto& m : matches) opts += m + "  ";
-                        set_status(StatusType::PROCESSING, opts);
-                    }
+                    for (const auto& o : opts) if (o.rfind(arg, 0) == 0) matches.push_back(o);
+                    if (matches.size() == 1) { buf = cmd + " " + matches[0]; pos = (int)buf.size(); }
+                    else if (matches.size() > 1) { std::string line; for (const auto& m : matches) line += m + "  "; set_status(StatusType::PROCESSING, line); }
                 } else {
-                    std::string cmd = buf.substr(0, sp);
-                    std::string arg = buf.substr(sp + 1);
-                    std::vector<std::string> opts;
-                    if (cmd == "/theme") opts = {"dark", "matrix", "amber", "mono"};
-                    else if (cmd == "/effort") opts = {"low", "medium", "high"};
-                    else if (cmd == "/web" || cmd == "/auto" || cmd == "/shell") opts = {"on", "off"};
-                    if (!opts.empty()) {
-                        std::vector<std::string> matches;
-                        for (const auto& o : opts) if (o.rfind(arg, 0) == 0) matches.push_back(o);
-                        if (matches.size() == 1) {
-                            buf = cmd + " " + matches[0];
-                            pos = (int)buf.size();
-                        } else if (matches.size() > 1) {
-                            std::string line;
-                            for (const auto& m : matches) line += m + "  ";
-                            set_status(StatusType::PROCESSING, line);
-                        }
-                    }
+                    _complete_path(buf, pos);   // /edit, /save, /load, @file, or a bare path token
                 }
             }
         }
@@ -1511,6 +1502,56 @@ std::string ProTUI::get_input() {
     input_lines_ = 1;
     _setup_windows();
     return result;
+}
+
+// Tab-complete the whitespace-delimited path token ending at the cursor. Handles a
+// leading '@' (file injection) and '~'. Completes to the longest common prefix; a sole
+// directory match gains a trailing '/', a sole file match a trailing space.
+bool ProTUI::_complete_path(std::string& buf, int& pos) {
+    namespace fs = std::filesystem;
+    int start = pos;
+    while (start > 0 && buf[start - 1] != ' ' && buf[start - 1] != '\n' && buf[start - 1] != '\t') start--;
+    std::string token = buf.substr(start, pos - start);
+    bool at = !token.empty() && token[0] == '@';
+    std::string raw = at ? token.substr(1) : token;
+    std::string expanded = raw;
+    if (!expanded.empty() && expanded[0] == '~') {
+        const char* home = std::getenv("HOME");
+        if (home) expanded = std::string(home) + expanded.substr(1);
+    }
+    size_t slash = expanded.find_last_of('/');
+    std::string dirpart = slash == std::string::npos ? "" : expanded.substr(0, slash + 1);
+    std::string frag = slash == std::string::npos ? expanded : expanded.substr(slash + 1);
+    fs::path basedir = dirpart.empty() ? fs::path(".") : fs::path(dirpart);
+    std::error_code ec;
+    if (!fs::is_directory(basedir, ec)) { set_status(StatusType::PROCESSING, "no such dir"); return true; }
+
+    std::vector<std::string> names;
+    for (auto& e : fs::directory_iterator(basedir, fs::directory_options::skip_permission_denied, ec)) {
+        std::string n = e.path().filename().string();
+        if (n.rfind(frag, 0) != 0) continue;
+        if (frag.empty() && !n.empty() && n[0] == '.') continue;  // hide dotfiles unless asked
+        std::error_code dec;
+        names.push_back(e.is_directory(dec) ? n + "/" : n);
+    }
+    if (names.empty()) { set_status(StatusType::PROCESSING, "no path match"); return true; }
+    std::sort(names.begin(), names.end());
+
+    std::string lcp = names[0];
+    for (const auto& n : names) { size_t k = 0; while (k < lcp.size() && k < n.size() && lcp[k] == n[k]) k++; lcp = lcp.substr(0, k); }
+
+    std::string completed = dirpart + lcp;
+    std::string newtoken = (at ? std::string("@") : std::string()) + completed;
+    buf = buf.substr(0, start) + newtoken + buf.substr(pos);
+    pos = start + (int)newtoken.size();
+    if (names.size() == 1) {
+        if (completed.empty() || completed.back() != '/') { buf.insert(pos, " "); pos++; }
+    } else {
+        std::string opts; int shown = 0;
+        for (const auto& n : names) { opts += n + "  "; if (++shown >= 14) { opts += "\u2026"; break; } }
+        set_status(StatusType::PROCESSING, opts);
+    }
+    return true;
 }
 
 void ProTUI::add_command_to_history(const std::string& cmd) {

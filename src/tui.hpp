@@ -107,6 +107,7 @@ private:
     void _update_command_palette_results();
     void _render_command_palette();
     void _render_help();
+    bool _complete_path(std::string& buf, int& pos);
     void _render_agenda();
     void _agenda_refetch();
     std::string _agenda_add_prompt();

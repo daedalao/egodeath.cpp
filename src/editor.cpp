@@ -58,6 +58,7 @@ void Editor::load() {
     dirty_ = false;
     undo_.clear();
     set_lang_from_ext();
+    original_ = content();
 }
 
 std::string Editor::content() const {
@@ -70,7 +71,7 @@ std::string Editor::content() const {
 bool Editor::save() {
     if (!save_fn_) { status_ = "no save handler"; return false; }
     std::string err = save_fn_(path_, content());
-    if (err.empty()) { dirty_ = false; status_ = "wrote " + path_; return true; }
+    if (err.empty()) { dirty_ = false; original_ = content(); status_ = "wrote " + path_; return true; }
     status_ = "save failed: " + err;
     return false;
 }
@@ -147,7 +148,7 @@ void Editor::render(void* vw, int rows, int cols) {
     if (textw < 1) textw = 1;
     ensure_visible(textrows, textw, numw);
 
-    std::string title = " edit: " + path_ + (dirty_ ? "  [+]" : "");
+    std::string title = " edit: " + path_ + (dirty() ? "  [+]" : "");
     if ((int)title.size() > cols) title = title.substr(0, cols);
     title.resize(cols, ' ');
     wattron(w, A_REVERSE | COLOR_PAIR(C_KW));
@@ -184,7 +185,7 @@ void Editor::render(void* vw, int rows, int cols) {
     std::string modetag = mode_ == Mode::INSERT ? "-- INSERT --" : "-- NORMAL --";
     std::string left = " " + modetag + "  " + std::to_string(cy_ + 1) + ":" + std::to_string(cx_ + 1) +
                        (lang_.empty() ? "" : "  [" + lang_ + "]");
-    std::string right = (status_.empty() ? "i insert  Esc normal  :w save  :q quit  / search " : status_ + " ");
+    std::string right = (status_.empty() ? "i insert  :w save  :q quit  :q!/ZQ discard  ZZ save+quit " : status_ + " ");
     std::string bar = left;
     int pad = cols - (int)left.size() - (int)right.size();
     if (pad > 0) bar += std::string(pad, ' ') + right; else bar = left.substr(0, cols);
@@ -283,7 +284,7 @@ bool Editor::run_command(const std::string& cmd, bool& open) {
     while (!c.empty() && c.back() == ' ') c.pop_back();
     if (c == "w") { save(); return true; }
     if (c.rfind("w ", 0) == 0) { path_ = c.substr(2); set_lang_from_ext(); save(); return true; }
-    if (c == "q") { if (dirty_) { status_ = "unsaved changes (:q! to discard, :wq to save)"; } else open = false; return true; }
+    if (c == "q") { if (dirty()) { status_ = "unsaved changes — :q! or ZQ to discard, :wq/ZZ to save"; } else open = false; return true; }
     if (c == "q!") { open = false; return true; }
     if (c == "wq" || c == "x") { if (save()) open = false; return true; }
     status_ = "unknown command: :" + c;
@@ -317,7 +318,7 @@ void Editor::handle_insert(int ch) {
 
 bool Editor::handle_normal(void* vw, int rows, int cols, int ch, bool& open) {
     std::string& line = lines_[cy_];
-    bool was_g = (pending_ == "g"), was_d = (pending_ == "d");
+    bool was_g = (pending_ == "g"), was_d = (pending_ == "d"), was_Z = (pending_ == "Z");
     pending_.clear();
 
     switch (ch) {
@@ -353,6 +354,8 @@ bool Editor::handle_normal(void* vw, int rows, int cols, int ch, bool& open) {
             } else pending_ = "d";
             break;
 
+        case 'Z': if (was_Z) { if (save()) open = false; } else pending_ = "Z"; break;
+        case 'Q': if (was_Z) open = false; break;  // ZQ: quit, discard changes
         case 'u': if (!undo_.empty()) { auto s = undo_.back(); undo_.pop_back(); lines_ = s.lines; cy_ = s.cy; cx_ = s.cx; clamp(); dirty_ = true; status_ = "undo"; } else status_ = "nothing to undo"; break;
 
         case '/': search(vw, rows, cols); break;

@@ -25,7 +25,7 @@ private:
     enum class Mode { NORMAL, INSERT };
 
     std::vector<std::string> lines_{""};
-    std::string path_, lang_, status_;
+    std::string path_, lang_, status_, original_;
     Mode mode_ = Mode::NORMAL;
     int cy_ = 0, cx_ = 0;     // cursor (line, byte column)
     int top_ = 0, left_ = 0;  // scroll origin
@@ -40,6 +40,7 @@ private:
 
     void load();
     std::string content() const;
+    bool dirty() const { return content() != original_; }  // true only if it differs from disk-as-loaded
     bool save();
     void set_lang_from_ext();
 
