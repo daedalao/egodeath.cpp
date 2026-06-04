@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <map>
 #include <filesystem>
 
 namespace egodeath {
@@ -178,6 +179,20 @@ int ProTUI::request_tool_approval(const std::string& prompt) {
     return approval_result_ < 0 ? 0 : approval_result_;
 }
 
+std::string ProTUI::request_password(const std::string& prompt) {
+    std::unique_lock<std::mutex> lk(password_mtx_);
+    password_prompt_ = prompt;
+    password_buf_.clear();
+    password_result_.clear();
+    password_cancelled_ = false;
+    password_pending_.store(true);
+    password_cv_.wait(lk, [this]() { return !password_pending_.load() || !running_; });
+    std::string r = password_cancelled_ ? std::string() : password_result_;
+    std::fill(password_result_.begin(), password_result_.end(), '\0');  // scrub
+    password_result_.clear();
+    return r;
+}
+
 int ProTUI::ask_choice(const std::string& question, const std::vector<std::string>& options) {
     std::unique_lock<std::mutex> lk(choice_mtx_);
     choice_question_ = question;
@@ -239,22 +254,25 @@ void ProTUI::_setup_windows() {
     
     int in_h = input_lines_ + 2;
     int reas_h = show_reasoning_ ? 5 : 0, status_h = 1;
+    int queue_h = std::min(input_queue_count_.load(), 3);
     int cx0 = rsv_left_;
     int cw = std::max(10, x - rsv_left_ - rsv_right_);
     int cy_avail = std::max(6, y - rsv_bottom_);
-    int hist_h = std::max(1, cy_avail - dash_h - in_h - reas_h - status_h);
+    int hist_h = std::max(1, cy_avail - dash_h - in_h - reas_h - status_h - queue_h);
 
     if (dash_win_) delwin(dash_win_);
     if (hist_win_) delwin(hist_win_);
     if (reas_win_) delwin(reas_win_);
     if (in_win_) delwin(in_win_);
     if (status_win_) delwin(status_win_);
+    if (queue_win_) { delwin(queue_win_); queue_win_ = nullptr; }
 
     dash_win_ = newwin(dash_h, cw, 0, cx0);
     hist_win_ = newwin(hist_h, cw, dash_h, cx0);
     scrollok(hist_win_, TRUE);
     if (show_reasoning_) reas_win_ = newwin(reas_h, cw, dash_h + hist_h, cx0);
     status_win_ = newwin(status_h, cw, dash_h + hist_h + reas_h, cx0);
+    if (queue_h > 0) queue_win_ = newwin(queue_h, cw, dash_h + hist_h + reas_h + status_h, cx0);
     in_win_ = newwin(in_h, cw, cy_avail - in_h, cx0);
     keypad(in_win_, TRUE);
     wtimeout(in_win_, 200);
@@ -497,6 +515,146 @@ void ProTUI::open_agenda() {
     _agenda_refetch();
     refresh_ui(true);
 }
+void ProTUI::open_memory() {
+    input_mode_ = InputMode::MEMORY;
+    memory_sel_ = 0;
+    _memory_refetch();
+    refresh_ui(true);
+}
+
+void ProTUI::_plugin_kick_refresh() {
+    if (plugin_refreshing_.exchange(true)) return;  // one refresh in flight at a time
+    std::string name = plugin_active_name_;
+    std::thread([this, name]() {
+        std::string out = plugin_runner_ ? plugin_runner_(name, "panel", "") : std::string("(no plugin runner)");
+        { std::lock_guard<std::mutex> lk(plugin_mtx_); plugin_buf_ = out; }
+        plugin_last_refresh_ = std::chrono::steady_clock::now();
+        plugin_refreshing_.store(false);
+    }).detach();
+}
+
+void ProTUI::open_plugin_panel(const std::string& name) {
+    const PluginPanelMeta* meta = nullptr;
+    for (const auto& p : plugin_panels_) if (p.name == name) { meta = &p; break; }
+    plugin_active_name_ = name;
+    plugin_title_ = meta ? meta->title : name;
+    plugin_refresh_ = meta ? meta->refresh : 0;
+    plugin_scroll_ = 0;
+    { std::lock_guard<std::mutex> lk(plugin_mtx_); plugin_buf_ = "(loading\xe2\x80\xa6)"; }
+    input_mode_ = InputMode::PLUGIN;
+    plugin_last_refresh_ = std::chrono::steady_clock::now() - std::chrono::hours(1);  // force first load
+    _plugin_kick_refresh();
+    refresh_ui(true);
+}
+
+void ProTUI::_render_plugin() {
+    if (!hist_win_) return;
+    werase(hist_win_);
+    int h = getmaxy(hist_win_), w = getmaxx(hist_win_);
+    std::string buf;
+    { std::lock_guard<std::mutex> lk(plugin_mtx_); buf = plugin_buf_; }
+
+    std::vector<std::string> lines;
+    { std::string cur; for (char c : buf) { if (c == '\n') { lines.push_back(cur); cur.clear(); } else if (c != '\r') cur.push_back(c); } lines.push_back(cur); }
+
+    int r = 0;
+    wattron(hist_win_, A_BOLD | COLOR_PAIR(3));
+    mvwaddstr(hist_win_, r++, 0, ("\xe2\x8c\xa7 " + plugin_title_).c_str());
+    wattroff(hist_win_, A_BOLD | COLOR_PAIR(3));
+
+    if (plugin_scroll_ > (int)lines.size() - 1) plugin_scroll_ = std::max(0, (int)lines.size() - 1);
+    for (int i = plugin_scroll_; i < (int)lines.size() && r < h; ++i) {
+        std::string ln = lines[i];
+        if ((int)ln.size() > w - 1) ln = ln.substr(0, w - 1);
+        mvwaddstr(hist_win_, r++, 0, ln.c_str());
+    }
+    wnoutrefresh(hist_win_);
+
+    werase(status_win_);
+    wattron(status_win_, COLOR_PAIR(9));
+    mvwaddstr(status_win_, 0, 1, ("PLUGIN " + plugin_title_ + "   j/k scroll  r refresh  q/Esc exit").c_str());
+    wattroff(status_win_, COLOR_PAIR(9));
+    wnoutrefresh(status_win_);
+}
+void ProTUI::_memory_refetch() {
+    if (memory_provider_) {
+        try { memory_items_ = memory_provider_(); } catch (...) { memory_items_ = json::array(); }
+    }
+    if (!memory_items_.is_array()) memory_items_ = json::array();
+}
+void ProTUI::_render_memory() {
+    if (!hist_win_) return;
+    werase(hist_win_);
+    int h = getmaxy(hist_win_), w = getmaxx(hist_win_);
+    auto vlen = [](const std::string& s){ int n=0; for(unsigned char c:s) if((c&0xC0)!=0x80) n++; return n; };
+
+    // Group entries by category in array order; build the flat selectable order.
+    std::vector<std::string> cats;
+    std::map<std::string, std::vector<int>> by_cat;
+    for (int i = 0; i < (int)memory_items_.size(); ++i) {
+        std::string cat = memory_items_[i].value("category", std::string("unknown"));
+        if (!by_cat.count(cat)) cats.push_back(cat);
+        by_cat[cat].push_back(i);
+    }
+    memory_order_names_.clear();
+    for (auto& c : cats) for (int i : by_cat[c]) memory_order_names_.push_back(memory_items_[i].value("name", std::string()));
+    int n = (int)memory_order_names_.size();
+    if (memory_sel_ >= n) memory_sel_ = n - 1;
+    if (memory_sel_ < 0) memory_sel_ = 0;
+
+    int r = 0;
+    std::string _mtitle = "MEMORY  (" + std::to_string(n) + ")";
+    if (soul_name_provider_) { try { std::string _sn = soul_name_provider_(); if (!_sn.empty()) _mtitle += "    soul: " + _sn + "  (/soul)"; } catch (...) {} }
+    wattron(hist_win_, A_BOLD | COLOR_PAIR(3));
+    mvwaddstr(hist_win_, r++, 0, _mtitle.c_str());
+    wattroff(hist_win_, A_BOLD | COLOR_PAIR(3));
+
+    int sidx = 0;
+    for (auto& cat : cats) {
+        if (r >= h) break;
+        std::string s = std::string("\xe2\x94\x80\xe2\x94\x80 ") + cat + " (" + std::to_string(by_cat[cat].size()) + ") ";
+        wattron(hist_win_, COLOR_PAIR(1));
+        while (vlen(s) < w - 1) s += "\xe2\x94\x80";
+        mvwaddstr(hist_win_, r++, 0, s.c_str());
+        wattroff(hist_win_, COLOR_PAIR(1));
+        for (int i : by_cat[cat]) {
+            if (r >= h) break;
+            const auto& it = memory_items_[i];
+            bool selected = (sidx == memory_sel_);
+            bool pinned = it.value("pinned", false);
+            std::string scope = it.value("scope", std::string("global"));
+            long long uses = it.value("uses", (long long)0);
+            std::string nm = it.value("name", std::string());
+            std::string desc = it.value("description", std::string());
+            std::string scopetag = scope == "project" ? " \xc2\xb7proj" : "";
+            std::string left = std::string(selected ? "\xe2\x96\xb8" : " ") + " " +
+                               (pinned ? "\xf0\x9f\x93\x8c " : "  ") + nm + scopetag;
+            std::string right = (desc.empty() ? std::string() : desc) + "  (" + std::to_string(uses) + ")";
+            std::string full = left;
+            int pad = w - vlen(left) - vlen(right) - 1;
+            if (pad > 0) full += std::string(pad, ' ') + right;
+            int color = pinned ? 7 : 4;
+            if (selected) wattron(hist_win_, A_REVERSE | COLOR_PAIR(color));
+            else          wattron(hist_win_, COLOR_PAIR(color));
+            mvwaddstr(hist_win_, r, 0, full.c_str());
+            if (selected) wattroff(hist_win_, A_REVERSE | COLOR_PAIR(color));
+            else          wattroff(hist_win_, COLOR_PAIR(color));
+            r++; sidx++;
+        }
+    }
+    if (n == 0) {
+        wattron(hist_win_, COLOR_PAIR(10));
+        mvwaddstr(hist_win_, r++, 2, "(no memories yet)");
+        wattroff(hist_win_, COLOR_PAIR(10));
+    }
+    wnoutrefresh(hist_win_);
+
+    werase(status_win_);
+    wattron(status_win_, COLOR_PAIR(9));
+    mvwaddstr(status_win_, 0, 1, "MEMORY  j/k move  p pin  c category  d delete  r refresh  q/Esc exit");
+    wattroff(status_win_, COLOR_PAIR(9));
+    wnoutrefresh(status_win_);
+}
 
 void ProTUI::_agenda_refetch() {
     if (agenda_provider_) {
@@ -636,6 +794,7 @@ void ProTUI::_render_help() {
         {"  /agenda /tasks  task & calendar view", "  F2             toggle agenda view"},
         {"  /edit <path>    open code editor",     "  F3             edit last agent file"},
         {"  /editdock l|r|bottom|full  pane side", "  F4 / ^W        switch editor / chat focus"},
+        {"  /memory        memory view", "  F5             open / close memory view"},
     };
 
     int c2 = w / 2;
@@ -707,6 +866,8 @@ void ProTUI::_render_history() {
 
     if (input_mode_ == InputMode::HELP) { _render_help(); return; }
     if (input_mode_ == InputMode::AGENDA) { _render_agenda(); return; }
+    if (input_mode_ == InputMode::MEMORY) { _render_memory(); return; }
+    if (input_mode_ == InputMode::PLUGIN) { _render_plugin(); return; }
     if (choice_pending_.load()) { _render_choice(); return; }
 
     // If in command palette mode, render command palette instead of history
@@ -961,6 +1122,17 @@ void ProTUI::_draw_dashboard() {
 void ProTUI::_draw_status() {
     if (!status_win_) return;
 
+    if (password_pending_.load()) {
+        werase(status_win_);
+        std::string line = password_prompt_ + " " + std::string(password_buf_.size(), '*');
+        int sx = getmaxx(status_win_);
+        if ((int)line.size() > sx - 2) line = line.substr(0, sx - 2);
+        wattron(status_win_, COLOR_PAIR(8) | A_BOLD);
+        mvwaddstr(status_win_, 0, 1, line.c_str());
+        wattroff(status_win_, COLOR_PAIR(8) | A_BOLD);
+        wnoutrefresh(status_win_);
+        return;
+    }
     if (approval_pending_.load()) {
         werase(status_win_);
         std::string p = approval_prompt_;
@@ -986,10 +1158,12 @@ void ProTUI::_draw_status() {
     
     switch (status_type_) {
         case StatusType::IDLE: {
+            std::string _nm = soul_name_provider_ ? soul_name_provider_() : topic_;
+            if (_nm.empty()) _nm = topic_;
             if (status_detail_.empty())
-                status_line = fmt::format("{}: ready", topic_);
+                status_line = fmt::format("{}: ready", _nm);
             else
-                status_line = fmt::format("{}: ready  ·  {}", topic_, status_detail_);
+                status_line = fmt::format("{}: ready  ·  {}", _nm, status_detail_);
             color = 4;
             break;
         }
@@ -1040,10 +1214,37 @@ void ProTUI::_draw_status() {
     wnoutrefresh(status_win_);
 }
 
+void ProTUI::_render_queue() {
+    if (!queue_win_) return;
+    werase(queue_win_);
+    int h = getmaxy(queue_win_), w = getmaxx(queue_win_);
+    int n = (int)input_queue_.size();
+    int row = 0, first = 0;
+    if (n > h) {
+        int hidden = n - (h - 1);
+        std::string more = "  \xe2\x80\xa6 " + std::to_string(hidden) + " more queued";
+        wattron(queue_win_, COLOR_PAIR(10));
+        mvwaddstr(queue_win_, row++, 0, more.c_str());
+        wattroff(queue_win_, COLOR_PAIR(10));
+        first = hidden;
+    }
+    for (int i = first; i < n && row < h; ++i, ++row) {
+        const std::string& msg = input_queue_[i];
+        size_t nl = msg.find('\n');
+        std::string line = (nl == std::string::npos) ? msg : msg.substr(0, nl) + " \xe2\x80\xa6";
+        std::string full = "\xc2\xbb " + line;
+        if ((int)full.size() > w - 1) full = full.substr(0, w - 1);
+        wattron(queue_win_, COLOR_PAIR(3) | A_BOLD);
+        mvwaddstr(queue_win_, row, 0, full.c_str());
+        wattroff(queue_win_, COLOR_PAIR(3) | A_BOLD);
+    }
+    wnoutrefresh(queue_win_);
+}
+
 void ProTUI::refresh_ui(bool force) {
     if (editor_active_.load()) return;
     std::lock_guard<std::mutex> lock(mtx_);
-    _draw_dashboard(); _draw_status(); _draw_borders(); _render_history(); doupdate();
+    _draw_dashboard(); _draw_status(); _draw_borders(); _render_history(); _render_queue(); doupdate();
 }
 
 std::string ProTUI::get_input() {
@@ -1120,17 +1321,41 @@ std::string ProTUI::get_input() {
 
     while (true) {
         // If the agent needs the user while the editor has focus, pull focus back to chat.
-        if ((choice_pending_.load() || approval_pending_.load()) && focus_ == Focus::EDITOR) {
+        if ((choice_pending_.load() || approval_pending_.load() || password_pending_.load()) && focus_ == Focus::EDITOR) {
             focus_ = Focus::CHAT; editor_active_.store(false); refresh_ui(true);
         }
         // Editor pane has focus: route keys to it (F4 returns to the chat).
         if (editor_.is_open() && focus_ == Focus::EDITOR &&
-            !choice_pending_.load() && !approval_pending_.load()) {
+            !choice_pending_.load() && !approval_pending_.load() && !password_pending_.load()) {
             editor_.render();
             int ech = editor_.read_key();
             if (ech == ERR) continue;
             if (ech == KEY_F(4) || ech == 23) { focus_ = Focus::CHAT; editor_active_.store(false); refresh_ui(true); continue; }
             if (editor_.handle_key(ech)) close_editor();
+            continue;
+        }
+        // Secure password entry requested by the worker thread (masked, never echoed).
+        if (password_pending_.load()) {
+            refresh_ui();
+            int pch = wgetch(in_win_);
+            if (pch != ERR) {
+                bool done = false, cancel = false;
+                if (pch == '\n' || pch == '\r' || pch == KEY_ENTER) done = true;
+                else if (pch == 27) { cancel = true; done = true; }
+                else if (pch == KEY_BACKSPACE || pch == 127 || pch == 8) { if (!password_buf_.empty()) password_buf_.pop_back(); }
+                else if (pch >= 32 && pch < 127) password_buf_.push_back((char)pch);
+                if (done) {
+                    {
+                        std::lock_guard<std::mutex> lk(password_mtx_);
+                        password_result_ = cancel ? std::string() : password_buf_;
+                        password_cancelled_ = cancel;
+                    }
+                    std::fill(password_buf_.begin(), password_buf_.end(), '\0');  // scrub
+                    password_buf_.clear();
+                    password_pending_.store(false);
+                    password_cv_.notify_all();
+                }
+            }
             continue;
         }
         // Multiple-choice question requested by the agent (arrows/number/Enter).
@@ -1205,6 +1430,26 @@ std::string ProTUI::get_input() {
         
         ch = wgetch(in_win_);
         if (ch == ERR) {
+            // Drain queued input once the agent goes idle: hand the next message
+            // to the caller (which submits it as a normal turn).
+            if (input_mode_ == InputMode::NORMAL && buf.empty()) {
+                bool busy = busy_fn_ ? busy_fn_() : false;
+                if (!busy) {
+                    std::string next;
+                    { std::lock_guard<std::mutex> lk(mtx_);
+                      if (!input_queue_.empty()) { next = input_queue_.front(); input_queue_.erase(input_queue_.begin()); input_queue_count_.store((int)input_queue_.size()); } }
+                    if (!next.empty()) { _setup_windows(); return next; }
+                }
+            }
+            // Plugin panel: auto-refresh on its interval and repaint async output.
+            if (input_mode_ == InputMode::PLUGIN) {
+                if (plugin_refresh_ > 0 && !plugin_refreshing_.load()) {
+                    auto el = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now() - plugin_last_refresh_).count();
+                    if (el >= plugin_refresh_) _plugin_kick_refresh();
+                }
+                refresh_ui(true);
+            }
             // Agent-requested editor open (set from a background tool call).
             if (input_mode_ == InputMode::NORMAL && !editor_active_.load() && !approval_pending_.load()) {
                 std::string ep;
@@ -1262,6 +1507,23 @@ std::string ProTUI::get_input() {
             focus_ = Focus::EDITOR; editor_active_.store(true); editor_.render();
             continue;
         }
+        if (ch == KEY_F(5)) {
+            if (input_mode_ == InputMode::MEMORY) { input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true); }
+            else open_memory();
+            continue;
+        }
+        {
+            bool _ph = false;
+            for (const auto& _pp : plugin_panels_) {
+                if (_pp.key > 0 && ch == KEY_F(_pp.key)) {
+                    if (input_mode_ == InputMode::PLUGIN && plugin_active_name_ == _pp.name) {
+                        input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true);
+                    } else open_plugin_panel(_pp.name);
+                    _ph = true; break;
+                }
+            }
+            if (_ph) continue;
+        }
         if (input_mode_ == InputMode::AGENDA) {
             int n = (int)agenda_order_ids_.size();
             long long sel_id = (agenda_sel_ >= 0 && agenda_sel_ < n) ? agenda_order_ids_[agenda_sel_] : 0;
@@ -1282,6 +1544,40 @@ std::string ProTUI::get_input() {
             }
             continue;
         }
+        if (input_mode_ == InputMode::MEMORY) {
+            int n = (int)memory_order_names_.size();
+            std::string sel = (memory_sel_ >= 0 && memory_sel_ < n) ? memory_order_names_[memory_sel_] : std::string();
+            auto field = [&](const std::string& key, bool dflt) {
+                for (auto& it : memory_items_) if (it.value("name", std::string()) == sel) return it.value(key, dflt);
+                return dflt;
+            };
+            if (ch == 'q' || ch == 27) { input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true); }
+            else if (ch == 'j' || ch == KEY_DOWN) { if (memory_sel_ < n - 1) memory_sel_++; refresh_ui(true); }
+            else if (ch == 'k' || ch == KEY_UP)   { if (memory_sel_ > 0) memory_sel_--; refresh_ui(true); }
+            else if (ch == 'r') { _memory_refetch(); refresh_ui(true); }
+            else if (ch == 'd' && !sel.empty() && memory_action_) {
+                memory_action_("delete", sel, ""); _memory_refetch(); refresh_ui(true);
+            }
+            else if (ch == 'p' && !sel.empty() && memory_action_) {
+                bool pinned = field("pinned", false);
+                memory_action_(pinned ? "unpin" : "pin", sel, ""); _memory_refetch(); refresh_ui(true);
+            }
+            else if (ch == 'c' && !sel.empty() && memory_action_) {
+                static const std::vector<std::string> CATS = {"user","project","feedback","reference","preference","person","snippet","unknown"};
+                std::string cur = "unknown";
+                for (auto& it : memory_items_) if (it.value("name", std::string()) == sel) { cur = it.value("category", std::string("unknown")); break; }
+                size_t idx = 0; for (size_t i = 0; i < CATS.size(); ++i) if (CATS[i] == cur) { idx = i; break; }
+                memory_action_("category", sel, CATS[(idx + 1) % CATS.size()]); _memory_refetch(); refresh_ui(true);
+            }
+            continue;
+        }
+        if (input_mode_ == InputMode::PLUGIN) {
+            if (ch == 'q' || ch == 27) { input_mode_ = InputMode::NORMAL; set_status(StatusType::IDLE, ""); refresh_ui(true); }
+            else if (ch == 'j' || ch == KEY_DOWN) { plugin_scroll_++; refresh_ui(true); }
+            else if (ch == 'k' || ch == KEY_UP) { if (plugin_scroll_ > 0) plugin_scroll_--; refresh_ui(true); }
+            else if (ch == 'r') { _plugin_kick_refresh(); refresh_ui(true); }
+            continue;
+        }
 
         // ESC: Alt+Enter newline only
         if (ch == 27) {
@@ -1297,7 +1593,18 @@ std::string ProTUI::get_input() {
             else if (cancel_callback_) cancel_callback_(); // bare Esc → cancel stream
         }
         
-        if (ch == 13) break; // Enter (CR) submits the prompt (under nonl() mode)
+        if (ch == 13) {
+            // While the agent is busy, queue the message instead of submitting it.
+            // It shows as a highlighted line above the input and auto-submits when
+            // the agent goes idle; KEY_UP pulls the last one back to edit.
+            if (busy_fn_ && busy_fn_() && !buf.empty()) {
+                { std::lock_guard<std::mutex> lk(mtx_); input_queue_.push_back(buf); input_queue_count_.store((int)input_queue_.size()); }
+                buf.clear(); pos = 0; pending_paste_.clear();
+                _setup_windows(); refresh_ui(true);
+                continue;
+            }
+            break; // submit
+        }
         if (ch == 10) { // Shift+Enter or Ctrl+J (LF) inserts a newline
             buf.insert(pos++, 1, '\n');
             redraw_input();
@@ -1505,6 +1812,15 @@ std::string ProTUI::get_input() {
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             if (!pending_paste_.empty()) { buf.clear(); pending_paste_.clear(); pos = 0; }
             else if (pos > 0) { buf.erase(--pos, 1); }
+        }
+        else if (ch == KEY_UP) {
+            if (buf.empty()) {
+                std::string pulled;
+                { std::lock_guard<std::mutex> lk(mtx_);
+                  if (!input_queue_.empty()) { pulled = input_queue_.back(); input_queue_.pop_back(); input_queue_count_.store((int)input_queue_.size()); } }
+                if (!pulled.empty()) { buf = pulled; pos = (int)buf.size(); _setup_windows(); redraw_input(); }
+            }
+            continue;
         }
         else if (ch == KEY_LEFT) { if (pos > 0) pos--; }
         else if (ch == KEY_RIGHT) { if (pos < (int)buf.length()) pos++; }

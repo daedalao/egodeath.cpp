@@ -67,9 +67,95 @@ Store::Store(std::filesystem::path db_path) {
     exec("ALTER TABLE items ADD COLUMN project TEXT NOT NULL DEFAULT '';");  // ignored if present
     last_error_.clear();
     exec("CREATE INDEX IF NOT EXISTS idx_items_when ON items(status, kind, due, start_ts);");
+    exec("CREATE TABLE IF NOT EXISTS commands ("
+         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+         "norm TEXT NOT NULL,"
+         "raw TEXT NOT NULL,"
+         "source TEXT NOT NULL DEFAULT 'user',"
+         "project TEXT NOT NULL DEFAULT '',"
+         "count INTEGER NOT NULL DEFAULT 1,"
+         "last_ts TEXT NOT NULL DEFAULT '',"
+         "dismissed INTEGER NOT NULL DEFAULT 0"
+         ");");
+    exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_commands_norm ON commands(norm, project);");
 }
 
 Store::~Store() { if (db_) sqlite3_close(db_); }
+
+static std::string normalize_cmd(const std::string& s) {
+    std::string r; bool sp = false;
+    for (char c : s) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { sp = true; continue; }
+        if (sp && !r.empty()) r.push_back(' ');
+        sp = false; r.push_back(c);
+    }
+    return r;
+}
+
+void Store::record_command(const std::string& raw, const std::string& source, const std::string& project) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!db_) return;
+    std::string norm = normalize_cmd(raw);
+    if (norm.empty()) return;
+    size_t _a = raw.find_first_not_of(" \t\r\n"), _b = raw.find_last_not_of(" \t\r\n");
+    std::string disp = (_a == std::string::npos) ? norm : raw.substr(_a, _b - _a + 1);
+    std::string now = std::to_string((long long)std::time(nullptr));
+    sqlite3_stmt* st = nullptr;
+    const char* sql =
+        "INSERT INTO commands(norm,raw,source,project,count,last_ts,dismissed) VALUES(?,?,?,?,1,?,0) "
+        "ON CONFLICT(norm,project) DO UPDATE SET count=count+1, last_ts=excluded.last_ts, raw=excluded.raw;";
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, norm.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, disp.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, source.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, project.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, now.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+std::vector<CmdStat> Store::top_commands(int min_count, bool include_dismissed,
+                                         const std::vector<std::string>& projects, int limit) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<CmdStat> out;
+    if (!db_) return out;
+    std::string sql = "SELECT norm,raw,source,project,count,last_ts,dismissed FROM commands WHERE count>=?";
+    if (!include_dismissed) sql += " AND dismissed=0";
+    if (!projects.empty()) {
+        sql += " AND project IN (";
+        for (size_t i = 0; i < projects.size(); ++i) sql += (i ? ",?" : "?");
+        sql += ")";
+    }
+    sql += " ORDER BY count DESC, last_ts DESC LIMIT ?;";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
+    int idx = 1;
+    sqlite3_bind_int(st, idx++, min_count);
+    for (const auto& p : projects) sqlite3_bind_text(st, idx++, p.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, idx++, limit <= 0 ? 50 : limit);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        CmdStat c;
+        c.norm = col_text(st, 0); c.raw = col_text(st, 1); c.source = col_text(st, 2);
+        c.project = col_text(st, 3); c.count = sqlite3_column_int(st, 4);
+        c.last_ts = col_text(st, 5); c.dismissed = sqlite3_column_int(st, 6) != 0;
+        out.push_back(std::move(c));
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+bool Store::dismiss_command(const std::string& cmd) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!db_) return false;
+    std::string norm = normalize_cmd(cmd);
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "UPDATE commands SET dismissed=1 WHERE norm=?;", -1, &st, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(st, 1, norm.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    int ch = sqlite3_changes(db_);
+    sqlite3_finalize(st);
+    return ch > 0;
+}
 
 void Store::exec(const char* sql) {
     if (!db_) return;

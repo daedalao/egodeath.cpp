@@ -35,6 +35,14 @@ struct Item {
     std::string one_line() const; // compact human-readable form
 };
 
+// An observed shell command and how often it has been run, used by the
+// learn-from-repetition feature to suggest crystallizing it into a tool/memory.
+struct CmdStat {
+    std::string raw, norm, source, project, last_ts;
+    int count = 0;
+    bool dismissed = false;
+};
+
 class Store {
 public:
     explicit Store(std::filesystem::path db_path);
@@ -54,6 +62,12 @@ public:
                            const std::string& from, const std::string& to, int limit,
                            const std::vector<std::string>& projects = {});
     std::optional<Item> get(long long id);
+
+    // Observed-command log (learn-from-repetition).
+    void record_command(const std::string& raw, const std::string& source, const std::string& project);
+    std::vector<CmdStat> top_commands(int min_count, bool include_dismissed,
+                                      const std::vector<std::string>& projects, int limit);
+    bool dismiss_command(const std::string& cmd);
 
 private:
     sqlite3* db_ = nullptr;

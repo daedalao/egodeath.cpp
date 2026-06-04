@@ -1,4 +1,5 @@
 #include "agent.hpp"
+#include "plugins.hpp"
 #include "tui.hpp"
 #include <iostream>
 #include <csignal>
@@ -113,6 +114,30 @@ int main() {
     tui.set_agenda_action([&](const std::string& op, long long id, const std::string& arg) {
         return agent.agenda_action(op, id, arg);
     });
+    tui.set_memory_provider([&]() { return agent.memory_snapshot(); });
+    tui.set_memory_action([&](const std::string& op, const std::string& name, const std::string& arg) {
+        return agent.memory_action(op, name, arg);
+    });
+    tui.set_soul_name_provider([&]() { return agent.soul_name(); });
+    tui.set_busy_fn([&]() { return agent.is_busy(); });
+
+    // Interface plugins: dockless panels (F6+) and slash commands from
+    // ~/.config/egodeath/plugins/<name>/plugin.json
+    Plugins plugins;
+    std::filesystem::path proot = std::getenv("XDG_CONFIG_HOME")
+        ? std::filesystem::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath" / "plugins"
+        : std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".config" / "egodeath" / "plugins";
+    auto reload_plugins = [&]() {
+        plugins.load(proot);
+        std::vector<ProTUI::PluginPanelMeta> metas;
+        for (const auto& p : plugins.all())
+            if (p.has_panel) metas.push_back({p.name, p.panel_title.empty() ? p.name : p.panel_title, p.panel_key, p.panel_refresh});
+        tui.register_plugin_panels(metas);
+    };
+    reload_plugins();
+    tui.set_plugin_runner([&plugins](const std::string& n, const std::string& m, const std::string& a) {
+        return plugins.run_by_name(n, m, a);
+    });
     tui.set_editor_save_fn([&](const std::string& p, const std::string& c) { return agent.editor_save(p, c); });
     tui.set_last_file_provider([&]() { return agent.last_written_file(); });
     tui.set_editor_dock(pref_str("editor_dock", "right"));
@@ -169,10 +194,30 @@ int main() {
         agent.state.metrics = metrics;
     };
 
+    agent.boot_greeting();
+
     std::string cur_effort = config.reasoning_effort;
     while (tui.is_running()) {
         std::string input = tui.get_input();
         if (input == "/exit" || input == "/quit") break;
+
+        // Interface-plugin slash commands and /plugins listing.
+        if (input == "/plugins reload" || input == "/reload") {
+            reload_plugins();
+            tui.append_history("", "reloaded plugins:\n" + plugins.list_text(), "system");
+            continue;
+        }
+        if (input == "/plugins") { tui.append_history("", plugins.list_text(), "system"); continue; }
+        if (!input.empty() && input[0] == '/') {
+            std::string tok = input.substr(0, input.find(' '));
+            if (const auto* pp = plugins.by_slash(tok)) {
+                std::string pargs = input.size() > tok.size() ? input.substr(tok.size() + 1) : std::string();
+                tui.append_history("", tok + (pargs.empty() ? "" : " " + pargs), "system");
+                std::string pout = plugins.run(*pp, "command", pargs);
+                tui.append_history("", pout.empty() ? "(no output)" : pout, "system");
+                continue;
+            }
+        }
         if (input.empty()) continue;
 
         // Inline slash command: /mcp (list MCP servers and tools)
@@ -184,6 +229,42 @@ int main() {
         // Inline slash command: /agenda or /tasks (open the task/calendar view)
         if (input == "/agenda" || input == "/tasks" || input == "/cal" || input == "/calendar") {
             tui.open_agenda();
+            continue;
+        }
+
+        // Inline slash command: /memory or /mem (open the persistent memory view)
+        if (input == "/memory" || input == "/mem" || input == "/memories") {
+            tui.open_memory();
+            continue;
+        }
+
+        // Inline slash command: /learn (show the observed repeated-command log)
+        if (input == "/learn") {
+            tui.append_history("", agent.observed_commands_text(), "system");
+            continue;
+        }
+
+        // Inline slash command: /sudo-forget (clear any cached sudo password now)
+        if (input == "/sudo-forget" || input == "/sudo forget") {
+            agent.clear_sudo_cache();
+            tui.append_history("", "cached sudo password cleared", "system");
+            continue;
+        }
+
+        // Inline slash command: /soul (edit the agent's core identity in the editor)
+        if (input == "/soul") {
+            tui.open_editor(agent.soul_path());
+            continue;
+        }
+
+        // Inline slash command: /rename <name> (rename the agent / its soul)
+        if (input.rfind("/rename", 0) == 0) {
+            std::string arg = input.size() > 7 ? input.substr(7) : std::string();
+            while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
+            while (!arg.empty() && arg.back() == ' ') arg.pop_back();
+            if (arg.empty()) tui.append_history("", "usage: /rename <name>  (current: " + agent.soul_name() + ")", "system");
+            else { agent.set_soul_name(arg); std::string _ev = agent.soul_name(); std::string _fl = agent.soul_full_name();
+                   tui.append_history("", _fl == _ev ? ("renamed to: " + _ev) : ("renamed to: " + _fl + "  (going by " + _ev + ")"), "system"); }
             continue;
         }
 
@@ -334,6 +415,7 @@ int main() {
             cmd = (s == std::string::npos) ? "" : cmd.substr(s);
             if (cmd.empty()) { tui.append_history("", "usage: !<shell command>", "system"); continue; }
             tui.append_history("", "! " + cmd, "system");
+            agent.observe_command(cmd, "user");
             std::string out = Tools::exec_shell(cmd);
             if (out.empty()) out = "(no output)";
             if (out.size() > 6000) out = out.substr(0, 6000) + "\n\u2026 (truncated)";

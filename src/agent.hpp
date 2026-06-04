@@ -4,10 +4,14 @@
 #include "tools.hpp"
 #include "tui.hpp"
 #include "memory.hpp"
+#include "custom_tools.hpp"
+#include "soul.hpp"
+#include "shell_jobs.hpp"
 #include "mcp.hpp"
 #include "store.hpp"
 
 #include <queue>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -32,19 +36,34 @@ public:
     std::string mcp_status() const { return mcp_.status(); }
     json agenda_snapshot();
     std::string agenda_action(const std::string& op, long long id, const std::string& arg);
+    json memory_snapshot();
+    std::string memory_action(const std::string& op, const std::string& name, const std::string& arg);
+    std::string run_custom_tool(const std::string& name, const json& args, int rdepth);
+    std::string soul_name();
+    std::string soul_path();
+    std::string set_soul_name(const std::string& n);
+    std::string soul_full_name();
+    std::string sudo_password();      // cached or prompts the user (worker thread)
+    void clear_sudo_cache();
+    void observe_command(const std::string& cmd, const std::string& source);
+    std::string observed_commands_text();
+    void rebuild_system_prompt();
     std::string last_written_file();
     std::string editor_save(const std::string& path, const std::string& content);
     void cancel();
     ~Agent();
     
-    void run_step(const std::string& input, const std::string& display_override = "");
+    void run_step(const std::string& input, const std::string& display_override = "", bool silent = false);
+    void boot_greeting();  // on genuine first run, the agent speaks first
+    std::string get_user_info();
+    std::string set_user_info(const std::string& content);  // hard-capped; agent curates
     
     void turn_async(int depth = 0);
     void shutdown();
     
     void save_session(const std::string& path);
     void load_session(const std::string& path);
-    bool is_busy() const { return turn_running_.load(); }
+    bool is_busy() const { return turn_running_.load() || queued_.load() > 0; }
     
     UIState state;
     json history;
@@ -53,6 +72,21 @@ public:
 private:
     LlamaClient client_;
     Tools tools_;
+    CustomTools custom_tools_;
+    Soul soul_;
+    ShellJobs shell_jobs_;
+    // In-memory only sudo password cache (never serialized, logged, or sent to the model).
+    std::string sudo_pw_;
+    std::chrono::steady_clock::time_point sudo_pw_time_;
+    int sudo_ttl_secs_ = 300;
+    std::mutex sudo_mtx_;
+    bool first_boot_ = false;
+    // A single, always-loaded, agent-curated profile of the user. Hard-capped
+    // so the agent must decide what is worth keeping; updated without approval.
+    static constexpr size_t kUserInfoCap = 1023;
+    std::filesystem::path user_info_path_;
+    std::string user_info_;
+    std::mutex user_info_mtx_;
     ProTUI& tui_;
     std::mutex mtx_;
     
@@ -98,6 +132,7 @@ private:
     McpManager mcp_;
     std::unique_ptr<Store> store_;
     std::filesystem::path config_dir_;
+    std::string project_instructions_;  // optional per-project egodeath.md, layered under the soul
     std::string project_key_;  // per-directory task scope (the launch directory)
     json read_config();
     std::string write_config(const json& cfg);

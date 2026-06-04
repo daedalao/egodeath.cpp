@@ -7,6 +7,8 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
+#include <chrono>
 
 namespace egodeath {
 
@@ -26,6 +28,8 @@ enum class InputMode {
     COMMAND_PALETTE,     // command palette mode (Ctrl+P)
     HELP,                // help overlay (F1)
     AGENDA,              // task/calendar view (F2)
+    MEMORY,              // persistent memory view (F5)
+    PLUGIN,              // interface-plugin panel (F6+)
 };
 
 class ProTUI {
@@ -62,9 +66,11 @@ public:
     void activate_last_queued();
     static void sigint_received(); // called from SIGINT handler
     void set_cancel_callback(std::function<void()> cb) { cancel_callback_ = std::move(cb); }
+    void set_busy_fn(std::function<bool()> fn) { busy_fn_ = std::move(fn); }
     void set_effort_callback(std::function<void(const std::string&)> cb) { effort_callback_ = std::move(cb); }
     void set_initial_effort(const std::string& e) { reasoning_effort_ = e; }
     int request_tool_approval(const std::string& prompt); // worker thread: 0 deny, 1 once, 2 always
+    std::string request_password(const std::string& prompt); // worker thread; "" if cancelled
     int ask_choice(const std::string& question, const std::vector<std::string>& options); // blocks; -1 if dismissed
     void set_theme(const std::string& name);
     std::string current_theme() const { return theme_; }
@@ -78,6 +84,14 @@ public:
     void set_agenda_action(std::function<std::string(const std::string&, long long, const std::string&)> cb) { agenda_action_ = std::move(cb); }
     void open_agenda();
     bool agenda_open() const { return input_mode_ == InputMode::AGENDA; }
+    void set_memory_provider(std::function<json()> cb) { memory_provider_ = std::move(cb); }
+    void set_memory_action(std::function<std::string(const std::string&, const std::string&, const std::string&)> cb) { memory_action_ = std::move(cb); }
+    void open_memory();
+    struct PluginPanelMeta { std::string name, title; int key = 0; int refresh = 0; };
+    void register_plugin_panels(std::vector<PluginPanelMeta> panels) { plugin_panels_ = std::move(panels); }
+    void set_plugin_runner(std::function<std::string(const std::string&, const std::string&, const std::string&)> fn) { plugin_runner_ = std::move(fn); }
+    void open_plugin_panel(const std::string& name);
+    void set_soul_name_provider(std::function<std::string()> cb) { soul_name_provider_ = std::move(cb); }
     void open_editor(const std::string& path);
     void set_last_file_provider(std::function<std::string()> cb) { last_file_provider_ = std::move(cb); }
     void set_editor_save_fn(std::function<std::string(const std::string&, const std::string&)> cb) { editor_.set_save_fn(std::move(cb)); }
@@ -112,6 +126,11 @@ private:
     void _render_help();
     bool _complete_path(std::string& buf, int& pos);
     void _render_agenda();
+    void _render_memory();
+    void _render_plugin();
+    void _plugin_kick_refresh();
+    void _render_queue();
+    void _memory_refetch();
     void _render_choice();
     void close_editor();
     void _agenda_refetch();
@@ -124,6 +143,7 @@ private:
     WINDOW *reas_win_ = nullptr;
     WINDOW *in_win_ = nullptr;
     WINDOW *status_win_ = nullptr;
+    WINDOW *queue_win_ = nullptr;
 
     struct Line { 
         std::string text; 
@@ -184,6 +204,26 @@ private:
     json agenda_items_ = json::array();
     std::vector<long long> agenda_order_ids_;
     int agenda_sel_ = 0;
+    std::function<json()> memory_provider_;
+    std::function<std::string(const std::string&, const std::string&, const std::string&)> memory_action_;
+    json memory_items_ = json::array();
+    std::vector<std::string> memory_order_names_;
+    int memory_sel_ = 0;
+    std::function<std::string()> soul_name_provider_;
+    std::vector<PluginPanelMeta> plugin_panels_;
+    std::function<std::string(const std::string&, const std::string&, const std::string&)> plugin_runner_;
+    std::string plugin_active_name_, plugin_title_;
+    int plugin_refresh_ = 0;
+    int plugin_scroll_ = 0;
+    std::string plugin_buf_;
+    std::mutex plugin_mtx_;
+    std::atomic<bool> plugin_refreshing_{false};
+    std::chrono::steady_clock::time_point plugin_last_refresh_;
+    // User input queued while the agent is busy (editable; rendered as
+    // highlighted lines just above the input box).
+    std::function<bool()> busy_fn_;
+    std::vector<std::string> input_queue_;
+    std::atomic<int> input_queue_count_{0};
     Editor editor_;
     std::atomic<bool> editor_active_{false};
     Focus focus_ = Focus::CHAT;
@@ -201,6 +241,13 @@ private:
     std::condition_variable approval_cv_;
     std::string approval_prompt_;
     int approval_result_ = -1;
+    std::atomic<bool> password_pending_{false};
+    std::mutex password_mtx_;
+    std::condition_variable password_cv_;
+    std::string password_prompt_;
+    std::string password_buf_;
+    std::string password_result_;
+    bool password_cancelled_ = false;
     std::atomic<bool> choice_pending_{false};
     std::mutex choice_mtx_;
     std::condition_variable choice_cv_;

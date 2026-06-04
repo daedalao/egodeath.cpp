@@ -226,6 +226,11 @@ std::string Tools::exec_shell(const std::string& cmd) {
     pid_t pid = fork();
     if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return "error: fork failed"; }
     if (pid == 0) {
+        // Detach from the controlling terminal. Without this, a subprocess such as
+        // `sudo` opens /dev/tty directly (bypassing our redirected stdin) to prompt
+        // for a password, which tramples the ncurses display. As its own session
+        // leader with no controlling tty, sudo instead fails fast into the pipe.
+        setsid();
         // Child: route stdout AND stderr into the pipe; read stdin from /dev/null.
         // Passing cmd as a single argument to `sh -c` keeps multi-line scripts and
         // heredocs intact, and because stderr goes to the pipe (never the inherited
@@ -243,6 +248,57 @@ std::string Tools::exec_shell(const std::string& cmd) {
     while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) result.append(buf, (size_t)n);
     close(pipefd[0]);
     int status = 0; waitpid(pid, &status, 0);
+    if (result.size() > 512 * 1024) { result.resize(512 * 1024); result += "\n... [truncated at 512KB]"; }
+    if (result.find("no tty present") != std::string::npos ||
+        result.find("a terminal is required to read the password") != std::string::npos ||
+        result.find("a password is required") != std::string::npos) {
+        result += "\n[hint: this needs a sudo password. Use the run_sudo tool instead \u2014 it "
+                  "securely prompts the user for their password and runs the command as root.]";
+    }
+    return result.empty() ? "(empty output)" : result;
+}
+
+std::string Tools::exec_sudo(const std::string& command, const std::string& password, int& exit_code) {
+    exit_code = -1;
+    int out[2], in[2];
+    if (pipe(out) != 0) return "error: pipe failed";
+    if (pipe(in) != 0) { close(out[0]); close(out[1]); return "error: pipe failed"; }
+
+    pid_t pid = fork();
+    if (pid < 0) { close(out[0]); close(out[1]); close(in[0]); close(in[1]); return "error: fork failed"; }
+    if (pid == 0) {
+        // Detach from the terminal; read the password from the stdin pipe (-S) with an
+        // empty prompt (-p ""), then run the command as root via a shell.
+        setsid();
+        dup2(out[1], STDOUT_FILENO);
+        dup2(out[1], STDERR_FILENO);
+        dup2(in[0], STDIN_FILENO);
+        close(out[0]); close(out[1]); close(in[0]); close(in[1]);
+        execlp("sudo", "sudo", "-S", "-p", "", "--", "sh", "-c", command.c_str(), (char*)nullptr);
+        _exit(127);
+    }
+
+    close(out[1]); close(in[0]);
+    // Send the password (and a newline) to sudo, then close stdin so the command
+    // sees EOF. The password is only ever in this pipe write, never on argv/env/disk.
+    {
+        std::string line = password;
+        line.push_back('\n');
+        ssize_t off = 0;
+        while (off < (ssize_t)line.size()) {
+            ssize_t w = write(in[1], line.data() + off, line.size() - off);
+            if (w <= 0) break;
+            off += w;
+        }
+        std::fill(line.begin(), line.end(), '\0');  // best-effort scrub
+    }
+    close(in[1]);
+
+    std::string result; char buf[4096]; ssize_t n;
+    while ((n = read(out[0], buf, sizeof(buf))) > 0) result.append(buf, (size_t)n);
+    close(out[0]);
+    int status = 0; waitpid(pid, &status, 0);
+    exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (result.size() > 512 * 1024) { result.resize(512 * 1024); result += "\n... [truncated at 512KB]"; }
     return result.empty() ? "(empty output)" : result;
 }

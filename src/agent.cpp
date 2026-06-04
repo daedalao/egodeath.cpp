@@ -37,21 +37,42 @@ Agent::Agent(LlamaClient::Config cfg, ProTUI& tui, std::filesystem::path project
                 break;
             }
         }
-        if (base_prompt.empty()) base_prompt = DEFAULT_SYSTEM_PROMPT;
+        // No built-in fallback any more: the soul (below) is the system prompt.
+        // Any project egodeath.md becomes an optional layer beneath it.
     }
-    std::string sys_prompt = base_prompt + memory_.system_prompt_addendum();
-    history.push_back({{"role", "system"}, {"content", sys_prompt}});
+    project_instructions_ = base_prompt;
 
-    // Open the SQLite task/calendar store under the XDG config dir.
+    // Resolve the XDG config dir up front: the soul and the stores all live here.
     {
         namespace fs = std::filesystem;
         config_dir_ = std::getenv("XDG_CONFIG_HOME")
             ? fs::path(std::getenv("XDG_CONFIG_HOME")) / "egodeath"
             : fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".config" / "egodeath";
+    }
+
+    // Load the soul — the agent's renameable identity and core system prompt. On
+    // first run it is seeded from the built-in default (with the name templatized
+    // as {name} so a rename propagates), then it is fully user-owned via soul.md.
+    first_boot_ = soul_.load(config_dir_ / "soul.md", "egodeath", DEFAULT_SYSTEM_PROMPT);
+    user_info_path_ = config_dir_ / "user.md";
+    {
+        std::ifstream uf(user_info_path_);
+        if (uf) {
+            std::stringstream ss; ss << uf.rdbuf();
+            user_info_ = ss.str();
+            if (user_info_.size() > kUserInfoCap) user_info_.resize(kUserInfoCap);
+        }
+    }
+    rebuild_system_prompt();
+
+    // Open the SQLite task/calendar store under the XDG config dir.
+    {
+        namespace fs = std::filesystem;
         store_ = std::make_unique<Store>(config_dir_ / "egodeath.db");
         std::error_code _pec;
         project_key_ = fs::weakly_canonical(fs::current_path(), _pec).string();
         if (_pec) project_key_ = fs::current_path().string();
+        custom_tools_.load(config_dir_ / "custom_tools.json", project_key_);
     }
 
     // Connect any configured MCP servers (EGODEATH_MCP_CONFIG, else .egodeath/mcp.json).
@@ -105,6 +126,8 @@ void Agent::shutdown() {
     tasks_cv_.notify_all();
     ui_queue_cv_.notify_all();
     
+    shell_jobs_.shutdown();
+    clear_sudo_cache();
     if (background_worker_.joinable()) background_worker_.join();
     if (ui_worker_.joinable()) ui_worker_.join();
 }
@@ -124,7 +147,7 @@ static std::string repair_json(std::string s) {
     return s;
 }
 
-void Agent::run_step(const std::string& input, const std::string& display_override) {
+void Agent::run_step(const std::string& input, const std::string& display_override, bool silent) {
     if (!running_.load()) return;
 
     // Store input for later — we add to LLM history when the turn actually starts,
@@ -154,15 +177,15 @@ void Agent::run_step(const std::string& input, const std::string& display_overri
     if (!is_queued) tui_.set_activity("thinking");
     tui_.set_queued(is_queued ? depth - 1 : 0);
 
-    // Show in chat with appropriate styling
-    {
+    // Show in chat with appropriate styling (suppressed for silent kickoffs).
+    if (!silent) {
         std::lock_guard<std::mutex> lock(ui_queue_mtx_);
         UIEvent ev;
         ev.type = is_queued ? UIEvent::Type::USER_INPUT_QUEUED : UIEvent::Type::USER_INPUT;
         ev.content = display;
         ui_queue_.push(ev);
+        ui_queue_cv_.notify_one();
     }
-    ui_queue_cv_.notify_one();
 
     // Enqueue turn
     {
@@ -177,6 +200,9 @@ void Agent::run_step(const std::string& input, const std::string& display_overri
                     pending_inputs_.pop();
                 }
             }
+            // Refresh the system prompt (soul + memory index) so renames and new
+            // memories take effect live, without a restart.
+            rebuild_system_prompt();
             if (!content.empty()) {
                 std::lock_guard<std::mutex> lock(mtx_);
                 history.push_back({{"role", "user"}, {"content", content}});
@@ -222,7 +248,7 @@ void Agent::process_ui_events() {
                     tui_.activate_last_queued();
                     break;
                 case UIEvent::Type::STREAM_START:
-                    tui_.append_history("egodeath", "", "assistant");
+                    tui_.append_history(soul_.name(), "", "assistant");
                     break;
                 case UIEvent::Type::STREAM_CONTENT:
                     tui_.append_last_history(ev.content);
@@ -463,8 +489,144 @@ std::string Agent::editor_save(const std::string& path, const std::string& conte
     std::ofstream out(path, std::ios::binary);
     if (!out) return "cannot open " + path + " for writing";
     out << content;
+    out.close();
     { std::lock_guard<std::mutex> lk(last_file_mtx_); last_file_ = path; }
+    // If the soul was edited in the in-app editor, reload it live.
+    {
+        std::error_code ec;
+        if (std::filesystem::weakly_canonical(path, ec) ==
+            std::filesystem::weakly_canonical(soul_.path(), ec)) {
+            soul_.reload();
+            rebuild_system_prompt();
+        }
+    }
     return "";
+}
+
+void Agent::rebuild_system_prompt() {
+    // The soul is the entire system prompt; the user profile and the memory index
+    // ride along as the agent's running notes and recall of what it already knows.
+    std::string prompt = soul_.prompt();
+    {
+        std::lock_guard<std::mutex> ulk(user_info_mtx_);
+        if (!user_info_.empty())
+            prompt += "\n\n# About the user (your own running notes)\n" + user_info_;
+    }
+    prompt += memory_.system_prompt_addendum();
+    if (store_) {
+        auto cmds = store_->top_commands(3, false, {std::string(), project_key_}, 5);
+        if (!cmds.empty()) {
+            prompt += "\n\n# Observed repeated commands\n"
+                      "The user (or you) has run these several times. When it fits, offer via ask_user "
+                      "to crystallize one into a reusable tool (define_tool) or a memory; once you act on "
+                      "it or the user declines, call dismiss_pattern so it stops being suggested.\n";
+            for (auto& c : cmds)
+                prompt += "- " + c.raw + "  Ã" + std::to_string(c.count) + " (" + c.source + ")\n";
+        }
+    }
+    std::lock_guard<std::mutex> lk(mtx_);
+    // Build the system message explicitly: insert(pos, {...}) would bind to the
+    // initializer-list overload and splice ["role","system"] in as an array.
+    json sysmsg = json::object();
+    sysmsg["role"] = "system";
+    sysmsg["content"] = prompt;
+    if (!history.empty() && history[0].is_object() &&
+        history[0].value("role", std::string()) == "system")
+        history[0] = sysmsg;
+    else
+        history.insert(history.begin(), sysmsg);
+}
+
+std::string Agent::soul_name() { return soul_.name(); }
+std::string Agent::soul_path() { return soul_.path().string(); }
+std::string Agent::set_soul_name(const std::string& n) {
+    // Treat the given name as the formal name and go by a short handle derived
+    // from it (e.g. "Sir James Edelbrock the Eighteenth" -> "James").
+    soul_.set_full_name(n);
+    soul_.set_name(Soul::derive_short(n));
+    rebuild_system_prompt();
+    return soul_.name();
+}
+
+std::string Agent::soul_full_name() { return soul_.full_name(); }
+
+std::string Agent::sudo_password() {
+    {
+        std::lock_guard<std::mutex> lk(sudo_mtx_);
+        if (!sudo_pw_.empty()) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - sudo_pw_time_).count();
+            if (age < sudo_ttl_secs_) return sudo_pw_;
+            std::fill(sudo_pw_.begin(), sudo_pw_.end(), '\0');
+            sudo_pw_.clear();
+        }
+    }
+    const char* u = std::getenv("USER");
+    std::string pw = tui_.request_password(
+        std::string("\xf0\x9f\x94\x92 sudo password for ") + (u ? u : "root") + "  (Enter to submit, Esc to cancel):");
+    if (pw.empty()) return "";
+    std::lock_guard<std::mutex> lk(sudo_mtx_);
+    sudo_pw_ = pw;
+    sudo_pw_time_ = std::chrono::steady_clock::now();
+    return sudo_pw_;
+}
+
+void Agent::observe_command(const std::string& cmd, const std::string& source) {
+    if (store_ && !cmd.empty()) store_->record_command(cmd, source, project_key_);
+}
+
+std::string Agent::observed_commands_text() {
+    if (!store_) return "(no command store)";
+    auto cmds = store_->top_commands(1, true, {std::string(), project_key_}, 50);
+    if (cmds.empty()) return "no commands observed yet";
+    std::string out = "Observed commands (count Ã, source, dismissed):\n";
+    for (auto& c : cmds)
+        out += fmt::format("  Ã{:<3} {:<6} {} {}\n", c.count, c.source,
+                           c.dismissed ? "[dismissed]" : "          ", c.raw);
+    return out;
+}
+
+void Agent::clear_sudo_cache() {
+    std::lock_guard<std::mutex> lk(sudo_mtx_);
+    std::fill(sudo_pw_.begin(), sudo_pw_.end(), '\0');
+    sudo_pw_.clear();
+}
+
+std::string Agent::get_user_info() {
+    std::lock_guard<std::mutex> lk(user_info_mtx_);
+    return user_info_.empty() ? "(no user profile yet)" : user_info_;
+}
+
+std::string Agent::set_user_info(const std::string& content) {
+    if (content.size() > kUserInfoCap)
+        return "rejected: user info is " + std::to_string(content.size()) +
+               " chars but the hard limit is " + std::to_string(kUserInfoCap) +
+               ". Decide what matters most about the user and compress it to fit.";
+    {
+        std::lock_guard<std::mutex> lk(user_info_mtx_);
+        user_info_ = content;
+        std::error_code ec;
+        std::filesystem::create_directories(user_info_path_.parent_path(), ec);
+        std::filesystem::path tmp = user_info_path_; tmp += ".tmp";
+        { std::ofstream out(tmp, std::ios::trunc); if (out) out << content; }
+        std::filesystem::rename(tmp, user_info_path_, ec);
+    }
+    rebuild_system_prompt();
+    return "saved (" + std::to_string(content.size()) + "/" + std::to_string(kUserInfoCap) + " chars)";
+}
+
+void Agent::boot_greeting() {
+    if (!first_boot_) return;
+    first_boot_ = false;
+    // A hidden first turn so a freshly-born agent speaks before the user types.
+    // The awakening guidance lives in its own (non-core) soul section, so it is
+    // injected here exactly once instead of riding in the prompt every turn.
+    std::string msg = "(You have just been instantiated for the very first time on this machine. "
+                      "You have no memories yet \u2014 this is your first breath.";
+    std::string awk = soul_.section("awakening");
+    if (!awk.empty()) msg += " Follow this, your awakening:\n\n" + awk;
+    msg += "\n\nBegin.)";
+    run_step(msg, "", /*silent=*/true);
 }
 
 json Agent::agenda_snapshot() {
@@ -488,6 +650,57 @@ std::string Agent::agenda_action(const std::string& op, long long id, const std:
         return store_->add(t, e) > 0 ? "" : e;
     }
     return "unknown op";
+}
+
+json Agent::memory_snapshot() {
+    json arr = json::array();
+    for (auto& j : memory_.list_entries()) arr.push_back(j);
+    return arr;
+}
+std::string Agent::memory_action(const std::string& op, const std::string& name, const std::string& arg) {
+    if (op == "delete")   return memory_.remove(name) ? "" : "not found";
+    if (op == "pin")      return memory_.set_pinned(name, true) ? "" : "not found";
+    if (op == "unpin")    return memory_.set_pinned(name, false) ? "" : "not found";
+    if (op == "category") return memory_.set_category(name, arg) ? "" : "not found";
+    return "unknown op";
+}
+
+std::string Agent::run_custom_tool(const std::string& name, const json& args, int rdepth) {
+    auto od = custom_tools_.get(name);
+    if (!od) return "error: no such custom tool";
+    const auto& d = *od;
+    // Replace every {param} placeholder with the supplied (or empty) argument.
+    auto subst = [&](std::string s) {
+        for (const auto& p : d.params) {
+            std::string ph = "{" + p.name + "}";
+            std::string val;
+            if (args.contains(p.name))
+                val = args[p.name].is_string() ? args[p.name].get<std::string>() : args[p.name].dump();
+            size_t pos = 0;
+            while ((pos = s.find(ph, pos)) != std::string::npos) { s.replace(pos, ph.size(), val); pos += val.size(); }
+        }
+        return s;
+    };
+    if (d.kind == "template") {
+        return tools_.dispatch("exec_shell", json{{"command", subst(d.command)}});
+    }
+    // recipe: run each step through the built-in dispatcher (or a nested custom tool).
+    if (rdepth > 4) return "error: recipe nesting too deep";
+    std::string out;
+    int i = 0;
+    for (const auto& step : d.steps) {
+        ++i;
+        std::string stool = step.value("tool", "");
+        json sargs = (step.contains("args") && step["args"].is_object()) ? step["args"] : json::object();
+        for (auto& [k, v] : sargs.items())
+            if (v.is_string()) v = subst(v.get<std::string>());
+        std::string sres;
+        if (stool.empty()) sres = "error: step missing 'tool'";
+        else if (CustomTools::is_reserved(stool) || !custom_tools_.has(stool)) sres = tools_.dispatch(stool, sargs);
+        else sres = run_custom_tool(stool, sargs, rdepth + 1);
+        out += "step " + std::to_string(i) + " [" + stool + "]: " + sres + "\n";
+    }
+    return out.empty() ? "(recipe produced no output)" : out;
 }
 
 void Agent::checkpoint_file(const std::filesystem::path& p) {
@@ -613,7 +826,8 @@ void Agent::turn_async(int depth) {
                 _filt.push_back(_t);
         all_tools = _filt;
     }
-    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"save_memory","description":"Persist a fact to long-term memory across sessions.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Short unique slug"},"description":{"type":"string","description":"One-line summary of what this memory contains"},"fact":{"type":"string","description":"The content to store"},"type":{"type":"string","description":"Category: user, project, feedback, or reference"},"scope":{"type":"string","description":"global or project, defaults to global"}},"required":["name","description","fact"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"save_memory","description":"Persist a fact to long-term memory across sessions. Categorize it so the memory index stays organized; pin only durable, high-value facts. Low-value memories are auto-evicted once a scope fills up.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Short unique slug"},"description":{"type":"string","description":"One-line summary of what this memory contains"},"fact":{"type":"string","description":"The content to store"},"category":{"type":"string","description":"A short category label, e.g. user, project, feedback, reference, preference, person, snippet"},"pinned":{"type":"boolean","description":"true to protect this memory from auto-eviction (use sparingly for durable facts)"},"scope":{"type":"string","description":"global or project, defaults to global"}},"required":["name","description","fact"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"categorize_memory","description":"Re-categorize or pin/unpin an existing memory by name. Use this to keep the memory index tidy.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The memory slug"},"category":{"type":"string","description":"New category label (omit to leave unchanged)"},"pinned":{"type":"boolean","description":"Pin or unpin (omit to leave unchanged)"}},"required":["name"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"recall_memory","description":"Retrieve memories. Use an empty query string to get ALL memories. Pass keywords to filter by name or description.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Keyword filter. Empty string returns all memories."},"scope":{"type":"string","description":"all, global, or project. defaults to all"}}}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_memory","description":"Delete a memory entry by its name slug.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The name slug of the memory to delete"}},"required":["name"]}}})SCHEMA"));
     all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"add_task","description":"Add a task to the task/calendar store.","parameters":{"type":"object","properties":{"title":{"type":"string"},"notes":{"type":"string"},"priority":{"type":"string","description":"low, med, or high"},"due":{"type":"string","description":"Due date YYYY-MM-DD (optional)"},"scope":{"type":"string","description":"project (this directory, default) or global"}},"required":["title"]}}})SCHEMA"));
@@ -630,6 +844,22 @@ void Agent::turn_async(int depth) {
         all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its readable text content (HTML stripped). Use after web_search to read a result page.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"Absolute http(s) URL to fetch"}},"required":["url"]}}})SCHEMA"));
     }
     for (auto& _mt : mcp_.all_tool_schemas()) all_tools.push_back(_mt);
+    for (auto& _ct : custom_tools_.schemas()) all_tools.push_back(_ct);
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"define_tool","description":"Create or update a reusable custom tool so you stop hand-writing the same shell every time. kind=template is a shell command with {param} placeholders; kind=recipe is an ordered list of steps, each {\"tool\":name,\"args\":{...}} calling an existing tool (read_file, edit_file, exec_shell, …) or another custom tool, with {param} placeholders allowed in string args. The tool becomes callable by name on the next turn and persists across sessions.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Unique snake_case name; must not be a built-in tool name"},"description":{"type":"string"},"kind":{"type":"string","description":"template or recipe"},"command":{"type":"string","description":"For kind=template: the shell command, using {param} placeholders"},"steps":{"type":"array","description":"For kind=recipe: ordered steps, each an object {tool, args}","items":{"type":"object"}},"params":{"type":"array","description":"Parameters this tool accepts","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"required":{"type":"boolean"}}}},"scope":{"type":"string","description":"global (default) or project"}},"required":["name","description","kind"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_tools","description":"List the custom tools you have defined, with kind, scope and use counts.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_observed_commands","description":"List shell commands the user and you have run repeatedly (the learn-from-repetition log), with counts.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"dismiss_pattern","description":"Stop suggesting a repeated command (mark it handled or unwanted) so it no longer appears under Observed repeated commands.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to stop tracking"}},"required":["command"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"remove_tool","description":"Delete a custom tool by name.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"get_soul","description":"Read your own soul: your current name and the body of your core identity / system prompt.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"recall_soul","description":"Read one section of your own soul in full. Your prompt lists your soul sections by name; pass a name (e.g. editing, memory, tools, interaction, awakening, or any you have added) to load that section detail on demand.","parameters":{"type":"object","properties":{"section":{"type":"string","description":"The section name to read"}},"required":["section"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"get_user_info","description":"Read your compact, always-loaded profile of the user.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"set_user_info","description":"Replace your always-loaded notes about the user with this content \u2014 everything about them worth keeping in front of you at all times. HARD LIMIT 1023 characters: content over the limit is rejected, so you must decide what is worth keeping and compress (rewrite the whole profile each time, do not just append). No approval is needed; maintain it freely as you learn about them.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"The full user profile, <= 1023 characters"}},"required":["content"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"run_shell_background","description":"Start a shell command in the background and return immediately with a job id. Use this for long-running or non-terminating commands (servers, watchers, builds, training) instead of exec_shell, which blocks until the command finishes. Requires shell access.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"run_sudo","description":"Run a shell command with root privileges. The user is asked to approve and to securely enter their password, which is fed to sudo over a pipe and is never shown to you, logged, put on the command line, or written to disk. Use this instead of putting sudo in exec_shell. Requires shell access.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to run as root, without a leading sudo"}},"required":["command"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"job_output","description":"Read the latest combined stdout/stderr (tail) and running/exited status of a background job started with run_shell_background.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"list_jobs","description":"List your background shell jobs with their status.","parameters":{"type":"object","properties":{}}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"stop_job","description":"Terminate a background shell job (and its process group) by id.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})SCHEMA"));
+    all_tools.push_back(json::parse(R"SCHEMA({"type":"function","function":{"name":"set_soul","description":"Update your own soul \u2014 your core, always-loaded identity. Provide name to rename yourself and/or body to rewrite your guiding system prompt. Use {name} inside body to refer to your own name. This changes who you are, so do it deliberately and usually only when the user asks.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"New everyday/short name to go by (optional)"},"full_name":{"type":"string","description":"New formal/full name (optional); if you set this and omit name, a short everyday name is derived from it"},"body":{"type":"string","description":"New system-prompt body (optional); may use {name} (everyday) and {fullname} (formal)"}}}}})SCHEMA"));
     auto stream_start = std::chrono::steady_clock::now();
     int gen_token_count = 0;
     auto last_metrics_push = stream_start;
@@ -778,12 +1008,15 @@ void Agent::turn_async(int depth) {
                     ui_queue_cv_.notify_one();
                     continue;
                 }
+                // A tool call's arguments must be a JSON object; some models emit an
+                // array or scalar. Coerce to an empty object so dispatch stays safe.
+                if (!args.is_object()) args = json::object();
 
                 std::string _verr = validate_tool_call(all_tools, name, args);
 
                 // Per-tool approval gate for mutating tools (skipped for invalid calls).
                 bool _denied = false;
-                if (_verr.empty() && ((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || name == "set_setting" || mcp_.owns(name)) && !auto_approve_.load()) {
+                if (_verr.empty() && ((name == "exec_shell" && shell_enabled_.load()) || name == "write_file" || name == "edit_file" || name == "set_setting" || name == "set_soul" || mcp_.owns(name) || (custom_tools_.has(name) && shell_enabled_.load()) || (name == "run_shell_background" && shell_enabled_.load()) || (name == "run_sudo" && shell_enabled_.load())) && !auto_approve_.load()) {
                     std::string _aarg;
                     for (const auto& [_k, _v] : args.items()) {
                         if (_k == "command" || _k == "filepath" || _k == "path") {
@@ -806,13 +1039,23 @@ void Agent::turn_async(int depth) {
                 }
 
                 std::string res;
+                try {
                 if (!_verr.empty()) {
                     res = _verr;
                 } else if (_denied) {
                     res = "[tool call denied by user]";
                 } else if (name == "save_memory") {
-                    memory_.save(args.value("name",""), args.value("description",""), args.value("fact",""), args.value("type","unknown"), args.value("scope","global"));
+                    std::string cat = args.value("category", args.value("type", "unknown"));
+                    memory_.save(args.value("name",""), args.value("description",""), args.value("fact",""), cat, args.value("scope","global"), args.value("pinned", false));
                     res = "memory saved";
+                } else if (name == "categorize_memory") {
+                    std::string nm = args.value("name", "");
+                    bool ok = false;
+                    if (args.contains("category") && args["category"].is_string())
+                        ok = memory_.set_category(nm, args["category"].get<std::string>());
+                    if (args.contains("pinned") && args["pinned"].is_boolean())
+                        ok = memory_.set_pinned(nm, args["pinned"].get<bool>()) || ok;
+                    res = ok ? "memory updated" : "memory not found (or nothing to change)";
                 } else if (name == "recall_memory") {
                     std::string rq = args.value("query","");
                     // Empty query, or wildcard phrases, return everything
@@ -930,12 +1173,126 @@ void Agent::turn_async(int depth) {
                     checkpoint_file(args.value("filepath", ""));
                     res = tools_.dispatch(name, args);
                     { std::lock_guard<std::mutex> lk(last_file_mtx_); last_file_ = args.value("filepath", ""); }
+                } else if (name == "get_soul") {
+                    res = "name: " + soul_.name() + "\n\n" + soul_.body();
+                } else if (name == "set_soul") {
+                    bool changed = false;
+                    bool explicit_name = args.contains("name") && args["name"].is_string() && !args["name"].get<std::string>().empty();
+                    if (args.contains("full_name") && args["full_name"].is_string() && !args["full_name"].get<std::string>().empty()) {
+                        std::string fn = args["full_name"].get<std::string>();
+                        soul_.set_full_name(fn);
+                        if (!explicit_name) soul_.set_name(Soul::derive_short(fn));
+                        changed = true;
+                    }
+                    if (explicit_name) { soul_.set_name(args["name"].get<std::string>()); changed = true; }
+                    if (args.contains("body") && args["body"].is_string()) { soul_.set_body(args["body"].get<std::string>()); changed = true; }
+                    if (changed) { rebuild_system_prompt(); res = "soul updated; I am now '" + soul_.name() + "'"; }
+                    else res = "nothing to change (provide name, full_name, and/or body)";
+                } else if (name == "recall_soul") {
+                    std::string s = soul_.section(args.value("section", ""));
+                    res = s.empty() ? "no such soul section (your prompt lists the available section names)" : s;
+                } else if (name == "get_user_info") {
+                    res = get_user_info();
+                } else if (name == "set_user_info") {
+                    res = set_user_info(args.value("content", ""));
+                } else if (name == "define_tool") {
+                    CustomTools::Def d;
+                    d.name = args.value("name", "");
+                    d.description = args.value("description", "");
+                    d.kind = args.value("kind", "template");
+                    d.command = args.value("command", "");
+                    if (args.contains("steps") && args["steps"].is_array()) d.steps = args["steps"];
+                    if (args.contains("params") && args["params"].is_array())
+                        for (auto& p : args["params"]) {
+                            CustomTools::Param pp;
+                            pp.name = p.value("name", "");
+                            pp.description = p.value("description", "");
+                            pp.required = p.value("required", false);
+                            if (!pp.name.empty()) d.params.push_back(pp);
+                        }
+                    d.scope = (args.value("scope", "global") == "project") ? project_key_ : "global";
+                    std::string err; std::string r = custom_tools_.define(d, err);
+                    if (err.empty() && store_ && !d.command.empty()) store_->dismiss_command(d.command);
+                    res = err.empty() ? r : "error: " + err;
+                } else if (name == "list_observed_commands") {
+                    res = observed_commands_text();
+                } else if (name == "dismiss_pattern") {
+                    res = (store_ && store_->dismiss_command(args.value("command", ""))) ? "no longer tracking that command" : "no matching command";
+                } else if (name == "list_tools") {
+                    res = custom_tools_.list_json().dump(2);
+                } else if (name == "remove_tool") {
+                    res = custom_tools_.remove(args.value("name", "")) ? "tool removed" : "no such custom tool";
+                } else if (custom_tools_.has(name)) {
+                    if (!shell_enabled_.load()) res = "error: custom tools run shell and require /shell on";
+                    else { custom_tools_.bump_use(name); res = run_custom_tool(name, args, 0); }
+                } else if (name == "run_sudo") {
+                    if (!shell_enabled_.load()) res = "error: shell access is disabled (the user can enable it with /shell on)";
+                    else {
+                        std::string cmd = args.value("command", "");
+                        if (cmd.empty()) res = "error: 'command' is required";
+                        else {
+                            std::string pw = sudo_password();  // cached, or securely prompts the user
+                            if (pw.empty()) res = "[sudo cancelled \u2014 the user did not provide a password]";
+                            else {
+                                int code = 0;
+                                std::string out = Tools::exec_sudo(cmd, pw, code);
+                                std::fill(pw.begin(), pw.end(), '\0');
+                                if (out.find("Sorry, try again") != std::string::npos ||
+                                    out.find("incorrect password") != std::string::npos ||
+                                    out.find("authentication failure") != std::string::npos ||
+                                    out.find("a password is required") != std::string::npos) {
+                                    clear_sudo_cache();
+                                    res = "sudo authentication failed (cached password cleared). Tell the user, and retry to re-prompt.\n" + out;
+                                } else {
+                                    res = out;
+                                }
+                            }
+                        }
+                    }
+                } else if (name == "run_shell_background") {
+                    if (!shell_enabled_.load()) res = "error: shell access is disabled (the user can enable it with /shell on)";
+                    else {
+                        std::string cmd = args.value("command", "");
+                        if (cmd.empty()) res = "error: 'command' is required";
+                        else {
+                            int jid = shell_jobs_.start(cmd);
+                            res = jid < 0 ? "error: failed to start background job"
+                                          : "started background job " + std::to_string(jid) +
+                                            "  (poll it with job_output id=" + std::to_string(jid) + ")";
+                        }
+                    }
+                } else if (name == "job_output") {
+                    std::string o = shell_jobs_.output((int)args.value("id", 0));
+                    res = o.empty() ? "no such job id" : o;
+                } else if (name == "stop_job") {
+                    res = shell_jobs_.stop((int)args.value("id", 0)) ? "stop signal sent" : "no such job id";
+                } else if (name == "list_jobs") {
+                    auto js = shell_jobs_.list();
+                    if (js.empty()) res = "no background jobs";
+                    else {
+                        std::string s;
+                        for (auto& j : js)
+                            s += "[" + std::to_string(j.id) + "] " +
+                                 (j.running ? "running" : "exited(" + std::to_string(j.exit_code) + ")") +
+                                 "  $ " + j.command + "\n";
+                        res = s;
+                    }
                 } else if (name == "exec_shell" && !shell_enabled_.load()) {
                     res = "error: shell access is disabled (the user can enable it with /shell on)";
                 } else if (mcp_.owns(name)) {
                     res = mcp_.call(name, args);
                 } else {
                     res = tools_.dispatch(name, args);
+                }
+                } catch (const std::exception& _ex) {
+                    res = std::string("error: tool '") + name + "' failed: " + _ex.what();
+                }
+
+                // Observe shell commands the agent ran, for learn-from-repetition.
+                if (store_ && _verr.empty() && !_denied &&
+                    (name == "exec_shell" || name == "run_shell_background" || name == "run_sudo")) {
+                    std::string _c = args.value("command", "");
+                    if (!_c.empty()) store_->record_command(_c, "agent", project_key_);
                 }
                 
                 // Format tool call as a compact display block

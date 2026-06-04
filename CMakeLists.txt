@@ -30,6 +30,10 @@ add_executable(egodeath
     src/sys_monitor.cpp
     src/mcp.cpp
     src/store.cpp
+    src/custom_tools.cpp
+    src/soul.cpp
+    src/shell_jobs.cpp
+    src/plugins.cpp
     src/editor.cpp
 )
 

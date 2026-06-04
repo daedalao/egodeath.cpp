@@ -17,6 +17,8 @@ public:
     std::string preview(const std::string& name, const json& args);
     std::string grep_search(const std::string& pat);
     static std::string exec_shell(const std::string& cmd);
+    // Run `command` as root via sudo, feeding `password` on stdin (never argv/env/disk).
+    static std::string exec_sudo(const std::string& command, const std::string& password, int& exit_code);
     static std::string list_directory(const std::filesystem::path& p);
     std::string glob_search(const std::string& pattern);
 
